@@ -27,3 +27,8 @@ Thumbs.db
 # Crawler runtime files
 crawler.log
 .crawler_checkpoint.json
+
+# Training data & output (large files, regenerate with prepare_training_data.py)
+training_data/
+hecaitou_output/
+*.gguf
