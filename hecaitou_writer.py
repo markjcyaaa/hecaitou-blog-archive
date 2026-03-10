@@ -442,20 +442,9 @@ def find_article_by_title(articles: List[dict], title: str) -> Optional[dict]:
 
 
 def _get_recommended_titles(article_type: str) -> set:
-    """从 Skill 文件的参考索引中提取对应类型的推荐原文标题。"""
-    # 硬编码关键推荐原文（与 Skill 文件第七章保持同步）
-    recommendations = {
-        "A": {"甘心和自己无关", "松鼠尾巴", "帮我把照片里的其他人P掉",
-               "再也不可能遇见那么好的人了", "恨的教育"},
-        "B": {"来自苹果的重击", "Google 做了淘宝的事", "艺术家未遂第三年",
-               "库克的防腐工程", "一次成功的个人反制", "翻译：创始人模式"},
-        "C": {"仅有他汀是不够的", "罗振宇聋了之后", "一年之得", "中年男子的最大福报"},
-        "D": {"不善的缘起", "六个比喻", "修行的姿势", "盲盒、黑盒以及错误", "有所不为"},
-        "E": {"年度读书总结（2025）", "历史的细节", "职业罪犯总是会清理现场",
-               "成功学与三个保罗"},
-        "F": {"写作者快乐的一天", "午睡悲伤综合征", "猫过马路", "挥别小笼包"},
-    }
-    return recommendations.get(article_type.upper(), set())
+    """返回空集合——不再硬编码推荐标题，避免固定标题反复出现在搜索结果中。
+    搜索完全依赖关键词匹配和类型匹配。"""
+    return set()
 
 
 # ============================================================
@@ -1677,7 +1666,7 @@ def main():
   python hecaitou_writer.py --topic "苹果发布新AI" --type B --style "更毒舌一些"
 
   # 指定锚点原文
-  python hecaitou_writer.py --topic "网红带货翻车" --ref "松鼠尾巴"
+  python hecaitou_writer.py --topic "网红带货翻车" --ref "某篇原文标题"
 
   # 使用完整原文作为参考（需要更大上下文）
   python hecaitou_writer.py --topic "xxx" --mode full --ctx 32768
