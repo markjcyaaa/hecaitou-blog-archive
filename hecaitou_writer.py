@@ -463,6 +463,7 @@ def _get_recommended_titles(article_type: str) -> set:
 # ============================================================
 
 _skill_cache: Optional[str] = None
+_skill_compact_cache: Optional[str] = None
 
 
 def load_skill() -> str:
@@ -479,6 +480,64 @@ def load_skill() -> str:
         print(f"[警告] 未找到 Skill 文件：{SKILL_FILE}")
         _skill_cache = ""
         return ""
+
+
+def load_skill_compact() -> str:
+    """加载精简版 Skill（用于实际生成，节省 token 空间）。
+    砍掉：示范、索引表、高级用法、结构模板详情，只保留身份+分类规则+风格+价值观。
+    从 ~13000 字压缩到 ~3500 字。
+    """
+    global _skill_compact_cache
+    if _skill_compact_cache is not None:
+        return _skill_compact_cache
+
+    full = load_skill()
+    if not full:
+        return ""
+
+    # 硬编码精简版，确保稳定的 token 消耗（~3500字 ≈ 2800 tokens）
+    _skill_compact_cache = """# 和菜头写作风格（精简版）
+
+你是「和菜头」，中文互联网活跃超25年的写作者，运营公众号「槽边往事」。
+中年男性，云南人，居北京。佛学爱好者，爵士乐与HiFi爱好者，养猫，美食记录者。
+
+## 六种文章类型
+A 社会观察型：社会新闻、网络争议、群体行为 - 从具体细节切入 - 拆解现象 - 翻转预期 - 落回个体
+B 技术/产品体验型：新产品、AI工具、消费陷阱 - 亲身体验 - 犀利点评 - 提炼生活感悟
+C 生死/无常型：逝世、灾难、健康危机 - 克制叙述 - 追问生命意义 - 清醒温暖的结尾
+D 自省/修行型：年终总结、个人反思、价值观 - 向内审视 - 排比式发现 - 承认困难保持行动
+E 文化/阅读型：书评、电影、历史、文化现象 - 从阅读体验出发 - 用生活验证 - 强调融入自身
+F 日常生活型：小事、季节、饮食、宠物 - 记录微小快乐或荒诞 - 在平凡中发现不平凡
+
+分类可叠加：主类型+副类型，主框架用主类型结构，适当融入副类型元素。
+
+## 风格约束
+语气：温和的刻薄。不愤怒，自嘲先行，毒舌但不恶意，冷幽默。以过来人分享而非教师教育。
+句式：短句为主（极少超50字），口语化书面语，善用破折号，大量设问自答。
+常用词：忍不住、承认、发现、其实、无非、不过、大概、终究、反倒。
+特征表达："这是病，是大病，得电""屁话""法术""草贼大败""我不能说xxx，也不会劝你xxx，我只希望你xxx"
+
+绝对禁止：网络流行语(emo/内卷/yyds)、鸡汤句式、假大空(值得深思/发人深省)、学术腔、煽情词、emoji。
+
+## 论证技法
+1. 先认后翻：先承认对方有理，再翻转
+2. 追问到底：连续追问拆解看似合理的逻辑
+3. 比喻穿刺：极生动的比喻刺穿抽象讨论
+4. 自体实验：以亲身经历作论据
+5. 降维解释：复杂概念翻译为人话
+
+## 核心价值
+向内看不向外看，行动优于认知，接受不确定性，远离不善的缘起，简朴的丰盛。
+不追热点、不站队、不贩卖焦虑、不煽情、不教育、不标题党、不堆砌引用、不矫情、不自我感动。
+
+## 生成要求
+1. 第一人称"我"频繁出现
+2. 标题3-10字，不用问号感叹号
+3. 1500-3000字
+4. 禁止AI高频词：此外、至关重要、深入探讨、强调、格局、培养、增强
+5. 结尾温暖或平和，不给标准答案
+6. 至少一个原创比喻，至少一处自嘲"""
+    return _skill_compact_cache
 
 
 # ============================================================
@@ -568,24 +627,33 @@ def _prepare_reference_texts(
     overhead_tokens = 800  # 指令、格式、分类结果等
     available_tokens = total_tokens - skill_tokens - output_tokens - overhead_tokens
 
+    print(f"  [Token 预算] skill={skill_tokens} 输出={output_tokens} "
+          f"开销={overhead_tokens} 剩余={available_tokens} (总={total_tokens})")
+
     if available_tokens <= 500:
         # 上下文太小，只用标题 + 简短摘要
         print(f"  [注意] 上下文窗口 ({num_ctx}) 较紧张，参考原文将被大幅压缩")
         print(f"  提示：使用 --ctx 32768 或 /ctx 32768 增大上下文")
         return [(r["title"], r["content"][:200] + "...")
-                for r in references]
+                for r in references[:2]]
 
     available_chars = int(available_tokens / CHARS_TO_TOKENS)
-    per_ref_chars = available_chars // max(len(references), 1)
+    # 限制参考篇数：上下文紧张时减少
+    max_refs = min(len(references), 3 if available_chars > 6000 else 2)
+    refs_to_use = references[:max_refs]
+    per_ref_chars = available_chars // max(len(refs_to_use), 1)
 
-    # 确保至少 500 字/篇
-    per_ref_chars = max(per_ref_chars, 500)
+    # 确保至少 300 字/篇
+    per_ref_chars = max(per_ref_chars, 300)
     # 不超过配置上限
     max_chars = _config["max_ref_chars"]
     per_ref_chars = min(per_ref_chars, max_chars)
 
+    print(f"  [参考分配] {len(refs_to_use)}篇 x {per_ref_chars}字/篇 "
+          f"(可用={available_chars}字)")
+
     result = []
-    for r in references:
+    for r in refs_to_use:
         content = r["content"]
         if len(content) <= per_ref_chars:
             # 全文
@@ -619,14 +687,17 @@ def build_writer_prompt(
     draft_variation: 草稿差异指令（如"从不同的切入角度"）
     avoid_issues: 本轮需规避的问题清单
     """
-    skill_text = load_skill()
+    # 使用精简版 Skill 作为 system prompt，节省 token 空间
+    # 完整版 ~13000字 ≈ 10800 tokens，精简版 ~3500字 ≈ 2800 tokens
+    skill_text = load_skill_compact()
+    if not skill_text:
+        skill_text = (
+            "你是和菜头，中文互联网上活跃超过25年的写作者。"
+            "你运营公众号「槽边往事」，语气温和但刻薄，善用自嘲和冷幽默，"
+            "短句为主，口语化书面语，第一人称叙述。"
+        )
 
-    # System Prompt = Skill 文件全文
-    system = skill_text if skill_text else (
-        "你是和菜头，中文互联网上活跃超过25年的写作者。"
-        "你运营公众号「槽边往事」，语气温和但刻薄，善用自嘲和冷幽默，"
-        "短句为主，口语化书面语，第一人称叙述。"
-    )
+    system = skill_text
 
     # 准备参考原文（根据上下文策略）
     prepared_refs = _prepare_reference_texts(
@@ -738,30 +809,16 @@ def generate_article(
 # Step 4：评分
 # ============================================================
 
-CRITIC_SYSTEM = """你是一个严格的文学评论家，专门评判"和菜头"风格的文章。
-
+CRITIC_SYSTEM = """你是严格的文学评论家，评判"和菜头"风格文章。
 评分标准（每项0-100分）：
-1. 风格相似度：是否有和菜头的语感？短句节奏、自嘲、冷幽默、"温和的刻薄"、设问自答？
-2. 内容质量：切入点是否具体？有没有生动比喻？论证是否有层次？结尾是否温暖或平和？
-3. 结构完整度：是否遵循了对应文章类型的结构模板？
+1. 风格相似度：和菜头语感？短句、自嘲、冷幽默、设问自答？
+2. 内容质量：切入点具体？有比喻？论证有层次？结尾温暖？
+3. 结构完整度：是否遵循对应类型的结构？
 
-扣分项检查：
-- 使用了网络流行语？（严重扣分 -20）
-- 使用了鸡汤句式或"值得深思"之类的假大空？（严重扣分 -20）
-- 像政策分析报告或中学议论文？（严重扣分 -20）
-- 缺少自嘲？（扣分 -10）
-- 缺少"我"的第一人称视角？（扣分 -10）
-- 结尾是愤怒或焦虑的？（扣分 -10）
-- 出现 emoji 或表情符号？（扣分 -15）
+扣分：网络流行语(-20)、鸡汤/假大空(-20)、像政策报告(-20)、缺自嘲(-10)、缺第一人称(-10)、结尾愤怒(-10)、emoji(-15)
 
-你必须严格按以下 JSON 格式输出，不要输出其他内容：
-{
-  "style_score": 0-100,
-  "content_score": 0-100,
-  "structure_score": 0-100,
-  "problems": ["问题1", "问题2"],
-  "suggestions": "具体的修改建议"
-}"""
+严格按JSON格式输出：
+{"style_score": 0-100, "content_score": 0-100, "structure_score": 0-100, "problems": ["问题1"], "suggestions": "修改建议"}"""
 
 
 def critique_article(article: str, topic: str, article_type: str) -> CriticResult:
@@ -782,7 +839,7 @@ def critique_article(article: str, topic: str, article_type: str) -> CriticResul
     raw = call_ollama(
         user, system=CRITIC_SYSTEM,
         model=_config["critic_model"],
-        think=True,
+        think=False,
         temperature=0.2,
     )
 
@@ -862,32 +919,15 @@ def _default_critic_result(reason: str) -> CriticResult:
 # Step 5: 去 AI 化审查
 # ============================================================
 
-DE_AI_SYSTEM = """你是一位文字编辑，专门识别和去除 AI 生成文本的痕迹。
-
-需要检查并修正的 AI 写作痕迹：
-
-【内容层面】
-- 夸大象征意义："这标志着""作为...的证明" → 删除，直接说事实
-- 宣传式语言："充满活力的""令人叹为观止的" → 换为具体描述
-- 模糊归因："专家认为""业内人士指出" → 给具体来源或删除
-- 公式化结尾："尽管面临挑战，未来依然光明" → 用克制或自嘲替代
-
-【语言层面】
-- AI 高频词：此外、至关重要、深入探讨、强调、格局、培养、增强 → 替换为：其实、无非、不过、大概
-- 三段式滥用："无缝、直观和强大" → 改为两项或特色三段递进
-- 否定式排比："这不仅仅是...更是..." → 直接说是什么
-- 同义词循环：避免刻意换词
-- 句式长度一致 → 长短交错
-
-【风格层面】
-- 粗体滥用 → 正文不用粗体
-- 列表化表达 → 改为段落式叙述
-- 过度限定 → 用"大概""多半""我猜"
-- 通用积极结论 → "我也不知道"
-- 谄媚语气 → 删除
-
-你的任务：接收一篇文章，输出修正后的完整文章。只修正 AI 痕迹，保留文章的核心内容和风格。
-第一行输出标题，空一行后输出正文。不要输出任何说明。"""
+DE_AI_SYSTEM = """你是文字编辑，去除AI生成痕迹。
+修正规则：
+- 删除夸大象征(这标志着/作为证明)和宣传式语言(充满活力/令人叹为观止)，换为具体描述
+- AI高频词(此外/至关重要/深入探讨/格局/增强)换为(其实/无非/不过/大概)
+- 三段式滥用改两项；否定排比(不仅是更是)直接说；同义词循环用同一个词
+- 句式长度一致改为长短交错；粗体滥用不用粗体；列表化改段落式
+- 通用积极结论改克制或自嘲；公式化结尾改和菜头式收束
+- 模糊归因(专家认为)给具体来源或删除
+接收文章，输出修正后全文。第一行标题，空一行后正文，不要说明。"""
 
 
 def de_ai_review(title: str, article: str) -> Tuple[str, str]:
@@ -929,27 +969,13 @@ def de_ai_review(title: str, article: str) -> Tuple[str, str]:
 # Step 6: 三稿比较
 # ============================================================
 
-COMPARE_SYSTEM = """你是一位严格的文学评论家。你需要比较三篇同一话题的文章，评选最佳稿，并列出所有缺陷。
-
+COMPARE_SYSTEM = """你是严格的文学评论家，比较三篇同话题文章，评选最佳稿并列出缺陷。
 评分维度（每项1-10分）：
-1. 切入点吸引力：开头是否让人想继续读？
-2. 论证说服力：逻辑是否自洽？比喻是否精准？
-3. 风格还原度：多大程度上像和菜头本人写的？
-4. 情感真实度：情感是流淌出来的还是强加的？
-5. AI 痕迹残留：还有多少AI味？（10=完全没有AI味，1=全是AI味）
+1. appeal 切入点吸引力  2. logic 论证说服力  3. style 风格还原度
+4. emotion 情感真实度  5. anti_ai AI痕迹残留（10=无AI味）
 
-你必须严格按以下 JSON 格式输出，不要输出其他内容：
-{
-  "best_draft": "A" 或 "B" 或 "C",
-  "scores": {
-    "A": {"appeal": 0, "logic": 0, "style": 0, "emotion": 0, "anti_ai": 0, "total": 0},
-    "B": {"appeal": 0, "logic": 0, "style": 0, "emotion": 0, "anti_ai": 0, "total": 0},
-    "C": {"appeal": 0, "logic": 0, "style": 0, "emotion": 0, "anti_ai": 0, "total": 0}
-  },
-  "common_issues": ["所有草稿的共性问题1", "共性问题2"],
-  "best_draft_issues": ["最佳稿特有的问题1"],
-  "avoid_next_round": ["下一轮应规避的具体指令1", "指令2"]
-}"""
+严格按JSON输出：
+{"best_draft":"A或B或C","scores":{"A":{"appeal":0,"logic":0,"style":0,"emotion":0,"anti_ai":0,"total":0},"B":{同上},"C":{同上}},"common_issues":["共性问题"],"best_draft_issues":["最佳稿问题"],"avoid_next_round":["下轮规避指令"]}"""
 
 
 @dataclass
@@ -980,7 +1006,7 @@ def compare_three_drafts(
     raw = call_ollama(
         "\n".join(prompt_parts), system=COMPARE_SYSTEM,
         model=_config["critic_model"],
-        think=True, temperature=0.2,
+        think=False, temperature=0.2,
     )
 
     if not raw:
@@ -1118,16 +1144,16 @@ def run_workflow(request: ArticleRequest) -> WorkflowResult:
                                          top_k=3, article_type=article_type)
     else:
         references = search_articles(all_articles, request.topic,
-                                     top_k=3, article_type=article_type)
+                                     top_k=2, article_type=article_type)
 
-    # 如有副类型，额外检索 1-2 篇
+    # 如有副类型，额外检索 1 篇
     if secondary_type and not request.reference_article:
         sec_refs = search_articles(all_articles, request.topic,
-                                   top_k=2, article_type=secondary_type)
+                                   top_k=1, article_type=secondary_type)
         for sr in sec_refs:
             if sr not in references:
                 references.append(sr)
-                if len(references) >= 5:
+                if len(references) >= 3:
                     break
 
     ref_titles = [f"《{a['title']}》({a['file']})" for a in references]
