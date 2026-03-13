@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-和菜头风格 LoRA 微调训练脚本 v4.1
+和菜头风格 LoRA 微调训练脚本 v4.2
 ==================================
 基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1060 篇文章进行风格微调。
 
+v4.2 修复（2026-03-13）：
+  - 彻底修复 completion-only loss 兼容性：
+    删除 DataCollatorForCompletionOnlyLM（新版 TRL 已移除）
+    删除 formatting_func（与 completion_only_loss=True 冲突）
+    改用 TRL 原生方案：SFTConfig(completion_only_loss=True)
+    数据格式改为纯文本 prompt/completion（不含 ChatML 特殊 token）
+  - evaluate_test_set 同步修复，与训练路径一致
+  - SFTConfig 参数名修正：max_length → max_seq_length
+
 v4.1 修复（2026-03-13）：
-  - 修复 RuntimeError "You must specify a formatting_func" 的根因：
-    TRL v0.24（Unsloth 锁定版本）不接受 list[dict] 格式的 prompt/completion，
-    必须是纯字符串。prepare_training_data.py v4.0 已改为输出 ChatML 纯字符串，
-    但 train_hecaitou.py 中的 print_category_distribution、evaluate_test_set
-    仍假设旧格式，已全部修复为兼容新旧两种格式。
-  - print_category_distribution: 兼容 str / list[dict] / messages 三种 prompt 格式
-  - evaluate_test_set: 添加 formatting_func + DataCollatorForCompletionOnlyLM，
-    与训练阶段保持一致（之前缺失导致评估也会报错）
+  - 修复 RuntimeError "You must specify a formatting_func" 的根因
 
 v4.0 更新（2026-03-13）：
   - train/val/test 三路数据：训练用 train，中间评估用 val，最终评估用 test
@@ -70,7 +72,7 @@ from pathlib import Path
 def check_environment():
     """检查运行环境，返回 GPU 信息。"""
     print("=" * 60)
-    print("和菜头风格 LoRA 微调训练脚本 v4.1")
+    print("和菜头风格 LoRA 微调训练脚本 v4.2")
     print("=" * 60)
 
     try:
@@ -406,74 +408,56 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         "bf16": use_bf16,
         "seed": 42,
         "report_to": "none",
-        "max_length": args.max_seq_len,
+        "max_seq_length": args.max_seq_len,
     }
 
     # ================================================================
-    # 核心修复：为 prompt/completion 格式提供 formatting_func
+    # v4.2 核心方案：原生 SFTConfig(completion_only_loss=True)
     #
-    # 根因：Unsloth 2026.3 + TRL v0.24 的 SFTTrainer 要求：
-    #   - 要么 dataset 有 "text" 字段 + dataset_text_field="text"
-    #   - 要么提供 formatting_func
-    #   即使 dataset 里有 "prompt"/"completion" 字段（纯字符串），
-    #   Unsloth 的 patch 仍然会检查是否提供了 formatting_func，
-    #   如果没有就抛出：RuntimeError: You must specify a formatting_func
+    # 数据格式：{"prompt": "纯文本", "completion": "纯文本"}
+    #   - prompt: system 指令 + user 请求（纯自然语言，不含特殊 token）
+    #   - completion: 文章正文（纯自然语言）
     #
-    # 解决方案：
-    #   显式提供 formatting_func，将 prompt + completion 拼接为完整文本。
-    #   同时设置 dataset_text_field="text"，让 Unsloth 正常工作。
+    # TRL 原生处理流程：
+    #   1. SFTTrainer 检测到 dataset 含 "prompt" + "completion" 列
+    #   2. 用 tokenizer.apply_chat_template() 将两者组装为模型输入
+    #   3. completion_only_loss=True 时，prompt 对应的 label 设为 -100
+    #   4. 仅 completion 部分参与 loss 计算
     #
-    # Completion-only loss 实现方式：
-    #   在 prompt/completion 格式下，prompt 以 <|im_start|>assistant\n 结尾，
-    #   completion 是纯正文 + <|im_end|>。
-    #   通过 response_template 参数告诉 TRL：
-    #   只对 "<|im_start|>assistant\n" 之后的内容计算 loss。
+    # 不需要也不能使用：
+    #   ❌ formatting_func     — 与 completion_only_loss 冲突
+    #   ❌ DataCollatorForCompletionOnlyLM — 新版 TRL 已移除
+    #   ❌ dataset_text_field  — prompt/completion 格式不需要
+    #   ❌ ChatML 特殊 token   — TRL 自动通过 chat_template 添加
     # ================================================================
 
-    formatting_func = None
     trainer_extra_kwargs = {}
 
     if data_format == "prompt_completion":
-        # prompt/completion 均为纯字符串（ChatML 格式）
-        def _format_prompt_completion(example):
-            prompt = example.get("prompt", "")
-            completion = example.get("completion", "")
-            if not prompt or not completion:
-                return ""
-            return prompt + completion
+        # 主路径：prompt/completion + completion_only_loss
+        sft_kwargs["completion_only_loss"] = True
 
-        formatting_func = _format_prompt_completion
-        sft_kwargs["dataset_text_field"] = "text"
-
-        # 设置 response_template 实现 completion-only loss
-        # prompt 以 "<|im_start|>assistant\n" 结尾，
-        # TRL 的 DataCollatorForCompletionOnlyLM 会在此标记之后开始计算 loss
-        try:
-            from trl import DataCollatorForCompletionOnlyLM
-            response_template = "<|im_start|>assistant\n"
-            collator = DataCollatorForCompletionOnlyLM(
-                response_template=response_template,
-                tokenizer=tokenizer,
-            )
-            trainer_extra_kwargs["data_collator"] = collator
-            print(f"  ✅ Loss 路径: prompt/completion + formatting_func + DataCollatorForCompletionOnlyLM")
-            print(f"     response_template = '<|im_start|>assistant\\n'")
-            print(f"     system 提示 + user 指令 → 不参与梯度计算")
-            print(f"     assistant 输出（文章正文） → 参与 loss 计算")
-        except Exception as e:
-            print(f"  ⚠️  DataCollatorForCompletionOnlyLM 加载失败: {e}")
-            print(f"  ⚠️  回退: prompt/completion + formatting_func（全序列 loss）")
-            print(f"     所有 token 均参与 loss 计算")
+        print(f"\n  [Loss 路径确认]")
+        print(f"    ✅ 数据集格式: prompt/completion（纯文本）")
+        print(f"    ✅ completion_only_loss = True")
+        print(f"    ✅ prompt（system+user 指令） → label=-100，不参与梯度")
+        print(f"    ✅ completion（文章正文）     → 参与 loss 计算")
+        print(f"    ❌ 未使用 formatting_func（与 completion_only_loss 冲突）")
+        print(f"    ❌ 未使用 DataCollatorForCompletionOnlyLM（已弃用）")
 
     elif data_format == "text":
-        # messages 转换后的纯文本格式
+        # 回退路径：messages 转换后的纯文本
         sft_kwargs["dataset_text_field"] = "text"
-        print(f"  ⚠️  Loss 路径: messages → 纯文本（全序列 loss）")
-        print(f"     建议迁移到 prompt/completion 格式以启用 completion-only loss")
+        print(f"\n  [Loss 路径确认]")
+        print(f"    ⚠️  数据集格式: text（全序列 loss）")
+        print(f"    ⚠️  所有 token 均参与 loss 计算")
+        print(f"    ⚠️  建议迁移到 prompt/completion 格式以启用 completion-only loss")
+        print(f"    ⚠️  运行: python prepare_training_data.py")
 
     else:
         sft_kwargs["dataset_text_field"] = "text"
-        print(f"  Loss 路径: fallback 纯文本（全序列 loss）")
+        print(f"\n  [Loss 路径确认]")
+        print(f"    ⚠️  数据集格式: fallback text（全序列 loss）")
 
     sft_config = SFTConfig(**sft_kwargs)
 
@@ -486,7 +470,6 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        formatting_func=formatting_func,
         args=sft_config,
         **trainer_extra_kwargs,
     )
@@ -571,34 +554,12 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         "fp16": False,
         "bf16": torch.cuda.is_bf16_supported(),
         "report_to": "none",
-        "max_length": args.max_seq_len,
+        "max_seq_length": args.max_seq_len,
     }
 
-    # 与训练一致：prompt_completion 格式需要 formatting_func + data_collator
-    formatting_func = None
-    trainer_extra_kwargs = {}
-
+    # 与训练保持一致：prompt_completion 用 completion_only_loss
     if data_format == "prompt_completion":
-        def _format_prompt_completion(example):
-            prompt = example.get("prompt", "")
-            completion = example.get("completion", "")
-            if not prompt or not completion:
-                return ""
-            return prompt + completion
-
-        formatting_func = _format_prompt_completion
-        sft_kwargs["dataset_text_field"] = "text"
-
-        try:
-            from trl import DataCollatorForCompletionOnlyLM
-            response_template = "<|im_start|>assistant\n"
-            collator = DataCollatorForCompletionOnlyLM(
-                response_template=response_template,
-                tokenizer=tokenizer,
-            )
-            trainer_extra_kwargs["data_collator"] = collator
-        except Exception:
-            pass
+        sft_kwargs["completion_only_loss"] = True
     else:
         sft_kwargs["dataset_text_field"] = "text"
 
@@ -609,9 +570,7 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         model=model,
         tokenizer=tokenizer,
         train_dataset=test_dataset,  # 不会训练，只用于 eval
-        formatting_func=formatting_func,
         args=sft_config,
-        **trainer_extra_kwargs,
     )
 
     metrics = trainer.evaluate(eval_dataset=test_dataset)
@@ -749,7 +708,7 @@ def export_merged_16bit(model, tokenizer, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="和菜头风格 LoRA 微调训练 v4.0",
+        description="和菜头风格 LoRA 微调训练 v4.2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：

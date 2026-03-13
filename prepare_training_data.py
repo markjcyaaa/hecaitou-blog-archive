@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-和菜头语料 → Unsloth SFT 训练数据 转换脚本 v4.0
+和菜头语料 → Unsloth SFT 训练数据 转换脚本 v4.2
 ==============================================
 从 classified/ 目录读取 ~1067 篇文章，转换为 Unsloth/TRL 可用的
 prompt/completion 格式训练数据（JSONL），支持 completion-only loss。
+
+v4.2 更新（2026-03-13）：
+  - 修复 completion-only loss 兼容性：
+    prompt/completion 输出为纯自然语言文本，不含 ChatML 特殊标记
+    TRL 的 SFTConfig(completion_only_loss=True) 会自动处理 tokenization
+    不再需要 formatting_func 或 DataCollatorForCompletionOnlyLM
 
 v4.0 更新（2026-03-13）：
   - 文章级切分：整篇文章为一个样本，不拆段落
@@ -451,46 +457,26 @@ def generate_instruction(article: dict, rng: random.Random, use_category: bool =
 # 转换为训练格式
 # ============================================================
 
-def messages_to_chatml(messages: list) -> str:
-    """
-    将 [{"role":...,"content":...},...] 转换为 ChatML 纯文本字符串。
-    
-    关键：TRL v0.24（Unsloth 锁定版本）要求 prompt/completion 是纯字符串，
-    不能是 list[dict]。否则 Unsloth 会抛出：
-      RuntimeError: You must specify a formatting_func
-    """
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role and content:
-            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-    return "\n".join(parts)
-
-
 def article_to_prompt_completion(article: dict, rng: random.Random,
                                   use_category: bool = True) -> dict:
     """
     将单篇文章转换为 prompt/completion 训练样本。
     
-    输出格式：prompt 和 completion 均为 ChatML 纯文本字符串。
-    TRL v0.24 的 SFTTrainer 会自动对 completion 部分计算 loss，
-    prompt 部分不参与梯度计算 → completion-only loss。
+    v4.2 格式：prompt 和 completion 均为纯自然语言文本，不含任何 ChatML 特殊标记。
+    
+    TRL 的 SFTConfig(completion_only_loss=True) 会自动：
+      1. 用 tokenizer.apply_chat_template() 将 prompt/completion 组装为模型输入
+      2. 仅对 completion 部分计算 loss，prompt 部分的 label 设为 -100
+    
+    因此数据里不需要、也不应该包含 <|im_start|>/<|im_end|> 等特殊 token。
     """
     instruction = generate_instruction(article, rng, use_category=use_category)
 
-    # 构造 prompt 部分：system + user（ChatML 纯文本字符串）
-    prompt_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": instruction},
-    ]
-    prompt_str = messages_to_chatml(prompt_messages)
-    # 在 prompt 末尾加上 assistant 的起始标记，让 completion 紧接其后
-    prompt_str += "\n<|im_start|>assistant\n"
+    # prompt = system 指令 + user 请求（纯文本，不含特殊标记）
+    prompt_str = f"{SYSTEM_PROMPT}\n\n{instruction}"
 
-    # 构造 completion 部分：纯文章正文（紧跟 prompt 的 assistant 标记）
-    output_text = f"# {article['title']}\n\n{article['body']}"
-    completion_str = output_text + "<|im_end|>"
+    # completion = 文章正文（纯文本）
+    completion_str = f"# {article['title']}\n\n{article['body']}"
 
     return {
         "prompt": prompt_str,
@@ -843,9 +829,10 @@ def main():
     # ---- Completion-only loss 确认 ----
     print(f"\n[Loss 模式确认]")
     if args.format == "enhanced":
-        print(f"  格式: prompt/completion → TRL 原生 completion-only loss")
-        print(f"  仅在 assistant 回复（文章正文）部分计算 loss")
-        print(f"  system 提示 + user 指令 不参与梯度计算")
+        print(f"  格式: prompt/completion 纯文本 → SFTConfig(completion_only_loss=True)")
+        print(f"  TRL 自动处理 tokenization 和 label masking")
+        print(f"  仅在 completion（文章正文）部分计算 loss")
+        print(f"  prompt（system+user 指令）不参与梯度计算")
     else:
         print(f"  格式: messages → 需在训练脚本中配置 completion-only loss")
 
@@ -942,7 +929,7 @@ def main():
         f.write(f"  模板 B（中等: 类别+标题+意向）: 30%\n")
         f.write(f"  模板 C（极简: 类别+标题）: 20%\n")
 
-        f.write(f"\nLoss 模式: completion-only（仅在文章正文部分计算 loss）\n")
+        f.write(f"\nLoss 模式: completion-only（SFTConfig(completion_only_loss=True)）\n")
         f.write(f"System Prompt: {SYSTEM_PROMPT}\n")
 
         f.write(f"\n过拟合判据建议:\n")
