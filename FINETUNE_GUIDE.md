@@ -1,9 +1,11 @@
-# 和菜头风格 LoRA 微调：从零到部署完整指南 v3.1
+# 和菜头风格 LoRA 微调：从零到部署完整指南 v3.2
 
-> **更新 2026-03-13 v3.1**：修复 formatting_func 兼容性，全面升级数据管线 + 训练脚本
+> **更新 2026-03-13 v3.2**：修复 completion-only loss 兼容性
+> - 使用 TRL 原生 `SFTConfig(completion_only_loss=True)`
+> - 数据格式改为纯文本 prompt/completion（不含 ChatML 特殊 token）
+> - 删除 `DataCollatorForCompletionOnlyLM` 和 `formatting_func` 依赖
 > - 文章级分层切分（train/val/test = 80%/10%/10%）
 > - 3 种混合 Prompt 模板（含类别信号）
-> - Completion-only loss（仅学写作，不学生成指令）
 > - 去重、少数类别过采样、数据泄漏检查
 > - 基线 vs 改进实验支持
 >
@@ -63,7 +65,7 @@
 | 切分方式 | 随机打乱 | 文章级 + 时间优先 + 类别分层 |
 | Prompt 模板 | 单一模板 | 3 种混合（A:B:C = 50:30:20） |
 | 类别信号 | 无 | 6 类标签融入 Prompt |
-| Loss 计算 | 全序列 | Completion-only（仅学文章正文） |
+| Loss 计算 | 全序列 | Completion-only（`SFTConfig(completion_only_loss=True)`）|
 | 去重 | 无 | 标题 + 正文哈希去重 |
 | 数据泄漏检查 | 无 | 自动检查 train/val/test 无重叠 |
 | 默认 epochs | 3 | 2（降低过拟合风险） |
@@ -559,29 +561,17 @@ print(f"总参数: {total/1e9:.2f}B, 可训练: {trainable/1e6:.1f}M ({100*train
 import time
 from trl import SFTTrainer, SFTConfig
 
-# prompt/completion 格式：需要显式提供 formatting_func + DataCollatorForCompletionOnlyLM
-from trl import DataCollatorForCompletionOnlyLM
-
-def formatting_func(example):
-    return example.get("prompt", "") + example.get("completion", "")
-
-response_template = "<|im_start|>assistant\n"
-collator = DataCollatorForCompletionOnlyLM(
-    response_template=response_template,
-    tokenizer=tokenizer,
-)
-
+# prompt/completion 纯文本格式 + completion_only_loss=True
+# 不需要 formatting_func 或 DataCollatorForCompletionOnlyLM
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
-    formatting_func=formatting_func,
-    data_collator=collator,
     args=SFTConfig(
-        dataset_text_field="text",
         output_dir="/content/hecaitou_output",
-        max_length=2048,
+        max_seq_length=2048,
+        completion_only_loss=True,  # 仅 completion 参与 loss
         num_train_epochs=2,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
@@ -643,25 +633,28 @@ for f in glob.glob("/content/hecaitou_gguf/*.gguf"):
 
 ## 附录 C：数据格式说明
 
-### v4.0 prompt/completion 格式（推荐）
+### v4.2 prompt/completion 格式（推荐）
 
-prompt 和 completion 均为 **ChatML 纯字符串**（不是 list[dict]）：
+prompt 和 completion 均为**纯自然语言文本**，不含任何 ChatML 特殊标记：
 
 ```json
 {
-  "prompt": "<|im_start|>system\n你是和菜头，运营公众号「槽边往事」。写作风格：温和的刻薄...<|im_end|>\n<|im_start|>user\n请以和菜头的风格，写一篇社会观察类文章。\n类别：社会观察\n标题：XXX\n概要：...\n核心意向：...<|im_end|>\n<|im_start|>assistant\n",
-  "completion": "# XXX\n\n正文...<|im_end|>"
+  "prompt": "你是和菜头，运营公众号「槽边往事」。写作风格：温和的刻薄，冷幽默...\n\n请以和菜头的风格，写一篇社会观察类文章。\n类别：社会观察\n标题：XXX\n概要：...\n核心意向：...",
+  "completion": "# XXX\n\n正文..."
 }
 ```
 
 **关键点**：
-- prompt 以 `<|im_start|>assistant\n` 结尾，引导模型从此处开始生成
-- completion 是纯文章正文 + `<|im_end|>`
-- TRL 通过 `DataCollatorForCompletionOnlyLM` + `response_template="<|im_start|>assistant\n"` 实现 completion-only loss
-- 仅在 assistant 回复（文章正文）部分计算 loss，system/user 不参与梯度计算
+- prompt 是 system 指令 + user 请求的纯文本拼接
+- completion 是文章正文的纯文本
+- **不含** `<|im_start|>`、`<|im_end|>` 等特殊 token
+- TRL 通过 `SFTConfig(completion_only_loss=True)` 自动处理：
+  1. 用 `tokenizer.apply_chat_template()` 添加特殊 token
+  2. 将 prompt 对应的 label 设为 -100（不参与梯度）
+  3. 仅 completion 部分参与 loss 计算
 
-> **重要**：TRL v0.24（Unsloth 锁定版本）要求 prompt/completion 必须是纯字符串。
-> 如果你的旧数据仍是 list[dict] 格式，请重新运行 `python prepare_training_data.py` 生成新数据。
+> **重要**：如果你的旧数据包含 ChatML 特殊标记或 list[dict] 格式，
+> 请重新运行 `python prepare_training_data.py` 生成新数据。
 
 ### 旧版 messages 格式（向后兼容）
 
@@ -675,7 +668,7 @@ prompt 和 completion 均为 **ChatML 纯字符串**（不是 list[dict]）：
 }
 ```
 
-训练脚本会自动检测并转换为纯文本格式（全序列 loss）。建议重新生成 v4.0 数据以获得 completion-only loss 优势。
+训练脚本会自动检测并转换为纯文本格式（全序列 loss）。建议重新生成 v4.2 数据以获得 completion-only loss 优势。
 
 ---
 
@@ -693,4 +686,4 @@ prompt 和 completion 均为 **ChatML 纯字符串**（不是 list[dict]）：
 
 ---
 
-*版本 v3.1 | 2026-03-13 | 修复 formatting_func 兼容性 + 全面升级数据管线 + 训练脚本 + 对照实验*
+*版本 v3.2 | 2026-03-13 | 修复 completion-only loss 兼容性 + 全面升级数据管线 + 训练脚本*
