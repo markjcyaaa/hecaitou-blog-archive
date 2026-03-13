@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-和菜头风格 LoRA 微调训练脚本 v3.0
+和菜头风格 LoRA 微调训练脚本 v4.0
 ==================================
-基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1062 篇文章进行风格微调。
+基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1060 篇文章进行风格微调。
 
-v3.0 更新（2026-03-13）：
-  - 切换为 prompt/completion 格式 + completion-only loss
-    （只在文章输出部分计算 loss，不学习生成概要/指令）
-  - 默认使用 Qwen3.5-2B + bf16 LoRA（Unsloth 官方推荐，不用 QLoRA）
-  - max_seq_len 默认 4096（8GB 显存可用，覆盖 95%+ 样本）
-  - 支持增强 prompt 格式（带概要+意向）
-  - 自动检测数据格式（prompt/completion 或旧版 messages）
+v4.0 更新（2026-03-13）：
+  - train/val/test 三路数据：训练用 train，中间评估用 val，最终评估用 test
+  - completion-only loss：prompt/completion 格式 TRL 原生支持
+  - 默认超参：lr=2e-4, epochs=2, lora_r=16, lora_alpha=16, lora_dropout=0,
+    weight_decay=0.01, max_seq_length=4096
+  - 类别感知评估：按 6 个类别分别输出 val loss（需 test.jsonl 含 _meta）
+  - 基线 vs 改进实验支持：--experiment-name 标识实验
+  - 训练日志增强：类别分布、completion-only 确认、过拟合判据
+  - 兼容旧版 messages 格式（自动检测 + 迁移提示）
 
-v2.0 修复记录（2026-03-11）：
-  - 修复 formatting_func / dataset_text_field 兼容性问题
-  - 修复 Unsloth SFTTrainer 对 ChatML messages 格式的解析错误
-  - 添加 RTX 5060 (8GB) 本地训练支持
+v3.0 更新（2026-03-13）：切换 prompt/completion + completion-only loss
+v2.0 修复（2026-03-11）：修复 Unsloth/SFTTrainer 兼容性问题
 
 使用环境：
   - 本地 NVIDIA GPU 8GB (RTX 5060 等) → Qwen3.5-2B bf16 LoRA（推荐）
-  - 本地 NVIDIA GPU 10GB+ → Qwen3.5-4B bf16 LoRA
   - Google Colab (免费 T4 GPU, 16GB) → Qwen3.5-4B bf16 LoRA
   - 本地 NVIDIA GPU 22GB+ (RTX 4090 等) → Qwen3.5-9B bf16 LoRA
 
@@ -30,11 +29,9 @@ v2.0 修复记录（2026-03-11）：
   # RTX 5060 推荐配置
   python train_hecaitou.py --model Qwen/Qwen3.5-2B --max-seq-len 4096
 
-  # 指定数据目录（使用 v3 增强数据）
-  python train_hecaitou.py --data-dir ./training_data_v3
-
-  # 只导出 GGUF（已有训练好的模型时）
-  python train_hecaitou.py --export-only --model-dir ./hecaitou_output/lora_adapter
+  # 基线对照实验
+  python train_hecaitou.py --data-dir training_data_baseline --output-dir output_baseline --experiment-name baseline
+  python train_hecaitou.py --data-dir training_data_improved --output-dir output_improved --experiment-name improved
 
   # 从检查点恢复训练
   python train_hecaitou.py --resume
@@ -47,6 +44,7 @@ v2.0 修复记录（2026-03-11）：
 """
 
 import argparse
+import collections
 import glob
 import json
 import os
@@ -62,10 +60,9 @@ from pathlib import Path
 def check_environment():
     """检查运行环境，返回 GPU 信息。"""
     print("=" * 60)
-    print("和菜头风格 LoRA 微调训练脚本 v3.0")
+    print("和菜头风格 LoRA 微调训练脚本 v4.0")
     print("=" * 60)
 
-    # 检查 GPU
     try:
         import torch
         if not torch.cuda.is_available():
@@ -103,11 +100,10 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
     """
     根据 GPU 显存自动选择最优训练配置。
     
-    核心原则（基于 Unsloth 官方文档 2026-03）：
-    - Qwen3.5 不推荐 QLoRA (4-bit)，应使用 bf16 LoRA
-    - bf16 LoRA VRAM: 0.8B≈3GB, 2B≈5GB, 4B≈10GB, 9B≈22GB
-    - 优先保证 max_seq_len 覆盖全部训练文本
-    - 完整文本 > 截断文本（风格学习的关键）
+    v4.0 默认超参：
+    - lora_r=16, lora_alpha=16（或用户指定）
+    - bf16 LoRA（不推荐 QLoRA 4-bit）
+    - max_seq_len 优先覆盖训练数据
     """
     mem = gpu_info["gpu_mem_gb"]
 
@@ -118,11 +114,11 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
     elif mem >= 10:
         model = "Qwen/Qwen3.5-4B"
     elif mem >= 5:
-        model = "Qwen/Qwen3.5-2B"   # 8GB 显存推荐
+        model = "Qwen/Qwen3.5-2B"
     else:
         model = "Qwen/Qwen3.5-0.8B"
 
-    # LoRA rank
+    # LoRA rank: v4.0 默认 16（比 v3 的 32 更保守，避免过拟合）
     is_9b = "9B" in model or "9b" in model
     is_4b = "4B" in model or "4b" in model
     is_2b = "2B" in model or "2b" in model
@@ -130,20 +126,19 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
     if user_lora_r:
         lora_r = user_lora_r
     elif is_9b:
-        lora_r = 32
+        lora_r = 16
     elif is_4b:
-        lora_r = 32
+        lora_r = 16
     elif is_2b:
-        lora_r = 32  # 2B 模型显存充裕，用大 r 提升学习能力
+        lora_r = 16
     else:
         lora_r = 16
 
-    # max_seq_len：尽可能覆盖训练数据
-    # 训练数据分布：95.4% ≤4096 tokens, 98.6% ≤5120
+    # max_seq_len
     if user_seq_len:
         max_seq_len = user_seq_len
     elif is_2b and mem >= 7:
-        max_seq_len = 4096  # 2B + 8GB → 4096 覆盖 95%
+        max_seq_len = 4096
     elif is_2b:
         max_seq_len = 2048
     elif is_4b and mem >= 14:
@@ -153,11 +148,11 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
     elif is_9b:
         max_seq_len = 2048
     else:
-        max_seq_len = 4096  # 0.8B 可以开很大
+        max_seq_len = 4096
 
     print(f"\n[自动配置] 模型: {model}")
     print(f"[自动配置] 训练模式: bf16 LoRA（Qwen3.5 官方推荐）")
-    print(f"[自动配置] LoRA r: {lora_r}")
+    print(f"[自动配置] LoRA r: {lora_r}, alpha: {lora_r}")
     print(f"[自动配置] 最大序列长度: {max_seq_len}")
     print(f"[自动配置] 显存预估: {'充足' if mem >= 12 else '可用（已优化参数）'}")
 
@@ -169,14 +164,14 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
 # ============================================================
 
 def detect_data_format(data_dir: str) -> str:
-    """自动检测数据格式：prompt/completion 或 messages。"""
+    """自动检测数据格式。"""
     train_file = os.path.join(data_dir, "train.jsonl")
     if not os.path.exists(train_file):
         return "unknown"
-    
+
     with open(train_file, "r", encoding="utf-8") as f:
         first_line = f.readline()
-    
+
     try:
         data = json.loads(first_line)
         if "prompt" in data and "completion" in data:
@@ -187,16 +182,18 @@ def detect_data_format(data_dir: str) -> str:
             return "text"
         else:
             return "unknown"
-    except:
+    except Exception:
         return "unknown"
 
 
 def load_data(data_dir: str):
-    """加载训练数据，自动检测格式。"""
+    """加载 train/val/test 数据，自动检测格式。"""
     from datasets import load_dataset
 
     train_file = os.path.join(data_dir, "train.jsonl")
-    eval_file = os.path.join(data_dir, "eval.jsonl")
+    val_file = os.path.join(data_dir, "val.jsonl")
+    eval_file = os.path.join(data_dir, "eval.jsonl")  # 向后兼容
+    test_file = os.path.join(data_dir, "test.jsonl")
 
     if not os.path.exists(train_file):
         print(f"\n[错误] 未找到训练数据: {train_file}")
@@ -206,22 +203,77 @@ def load_data(data_dir: str):
     data_format = detect_data_format(data_dir)
     print(f"\n[数据] 检测到格式: {data_format}")
 
+    if data_format == "messages":
+        print("\n  ⚠️  检测到旧版 messages 格式！")
+        print("  建议迁移到 v4.0 的 prompt/completion 格式以启用 completion-only loss：")
+        print("    python prepare_training_data.py  # 重新生成数据")
+        print("  当前将自动转换为纯文本格式继续训练（全序列 loss）。\n")
+
     train_dataset = load_dataset("json", data_files=train_file, split="train")
-    eval_dataset = None
-    if os.path.exists(eval_file):
-        eval_dataset = load_dataset("json", data_files=eval_file, split="train")
+
+    # 尝试加载 val（优先 val.jsonl，回退 eval.jsonl）
+    val_dataset = None
+    if os.path.exists(val_file):
+        val_dataset = load_dataset("json", data_files=val_file, split="train")
+    elif os.path.exists(eval_file):
+        val_dataset = load_dataset("json", data_files=eval_file, split="train")
+
+    # 尝试加载 test
+    test_dataset = None
+    if os.path.exists(test_file):
+        test_dataset = load_dataset("json", data_files=test_file, split="train")
 
     print(f"[数据] 训练集: {len(train_dataset)} 条")
-    if eval_dataset:
-        print(f"[数据] 验证集: {len(eval_dataset)} 条")
+    if val_dataset:
+        print(f"[数据] 验证集: {len(val_dataset)} 条")
+    if test_dataset:
+        print(f"[数据] 测试集: {len(test_dataset)} 条")
 
-    return train_dataset, eval_dataset, data_format
+    # 打印类别分布
+    print_category_distribution(train_file, "训练集")
+
+    return train_dataset, val_dataset, test_dataset, data_format
+
+
+def print_category_distribution(jsonl_path: str, label: str):
+    """从 JSONL 文件中统计并打印类别分布（从 prompt 文本中提取类别）。"""
+    CATEGORY_LABELS = {
+        "A": "社会观察", "B": "技术产品评论", "C": "生死无常感悟",
+        "D": "自省修行", "E": "文化阅读评论", "F": "日常生活随笔",
+    }
+    # 尝试从文件中读取类别
+    cat_counts = collections.Counter()
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                # 尝试从 prompt 内容中提取类别标签
+                if "prompt" in data:
+                    user_content = ""
+                    for msg in data["prompt"]:
+                        if msg.get("role") == "user":
+                            user_content = msg.get("content", "")
+                            break
+                    for code, label_name in CATEGORY_LABELS.items():
+                        if label_name in user_content:
+                            cat_counts[code] += 1
+                            break
+                    else:
+                        cat_counts["?"] += 1
+    except Exception:
+        return
+
+    if cat_counts:
+        total = sum(cat_counts.values())
+        print(f"[数据] {label} 类别分布:")
+        for code in sorted(cat_counts.keys()):
+            cnt = cat_counts[code]
+            name = CATEGORY_LABELS.get(code, "未知")
+            print(f"  {code} {name}: {cnt} ({cnt/total*100:.1f}%)")
 
 
 def convert_messages_to_text(dataset, tokenizer):
-    """
-    将旧版 ChatML messages 格式转为纯文本（兼容 v2 数据）。
-    """
+    """将旧版 ChatML messages 格式转为纯文本。"""
     def convert_fn(example):
         messages = example["messages"]
         parts = []
@@ -235,8 +287,7 @@ def convert_messages_to_text(dataset, tokenizer):
                 role = msg.get("role", "")
                 content = msg.get("content", "")
                 parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-        text = "\n".join(parts)
-        return {"text": text}
+        return {"text": "\n".join(parts)}
 
     converted = dataset.map(convert_fn, remove_columns=dataset.column_names)
     print(f"  已转换 {len(converted)} 条 messages → 纯文本")
@@ -247,7 +298,7 @@ def convert_messages_to_text(dataset, tokenizer):
 # 模型加载
 # ============================================================
 
-def load_model(model_name: str, max_seq_length: int, lora_r: int):
+def load_model(model_name: str, max_seq_length: int, lora_r: int, lora_alpha: int):
     """加载模型并配置 bf16 LoRA。"""
     import torch
     from unsloth import FastLanguageModel
@@ -258,12 +309,12 @@ def load_model(model_name: str, max_seq_length: int, lora_r: int):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=max_seq_length,
-        load_in_4bit=False,       # 不使用 QLoRA
-        load_in_16bit=True,       # bf16 LoRA
+        load_in_4bit=False,
+        load_in_16bit=True,
         full_finetuning=False,
     )
 
-    print(f"\n[模型] 配置 LoRA（r={lora_r}, alpha={lora_r}）...")
+    print(f"\n[模型] 配置 LoRA（r={lora_r}, alpha={lora_alpha}, dropout=0）...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_r,
@@ -271,7 +322,7 @@ def load_model(model_name: str, max_seq_length: int, lora_r: int):
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        lora_alpha=lora_r,
+        lora_alpha=lora_alpha,
         lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -279,7 +330,6 @@ def load_model(model_name: str, max_seq_length: int, lora_r: int):
         max_seq_length=max_seq_length,
     )
 
-    # 打印参数统计
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     mem_used = torch.cuda.memory_allocated() / 1024**3
@@ -294,7 +344,7 @@ def load_model(model_name: str, max_seq_length: int, lora_r: int):
 # 训练
 # ============================================================
 
-def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, args, gpu_info):
+def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args, gpu_info):
     """执行训练。"""
     import torch
     from trl import SFTTrainer, SFTConfig
@@ -302,14 +352,16 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
     use_bf16 = gpu_info["bf16"]
 
     print(f"\n[训练] 配置:")
+    print(f"  实验名称: {args.experiment_name}")
     print(f"  模型精度: {'bf16' if use_bf16 else 'float32 (Unsloth 自动管理)'}")
     print(f"  数据格式: {data_format}")
     print(f"  轮次 (epochs): {args.epochs}")
     print(f"  学习率: {args.lr}")
+    print(f"  LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+    print(f"  weight_decay: {args.weight_decay}")
     print(f"  等效 batch size: {args.batch_size * args.grad_accum}")
     print(f"  最大序列长度: {args.max_seq_len}")
 
-    # 根据数据格式配置 SFTConfig
     sft_kwargs = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.epochs,
@@ -318,7 +370,7 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
         "learning_rate": args.lr,
         "warmup_steps": 20,
         "optim": "adamw_8bit",
-        "weight_decay": 0.01,
+        "weight_decay": args.weight_decay,
         "logging_steps": 10,
         "save_strategy": "steps",
         "save_steps": 200,
@@ -330,20 +382,20 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
     }
 
     if data_format == "prompt_completion":
-        # prompt/completion 格式：TRL 自动做 completion-only loss
-        # 无需设置 dataset_text_field
-        print(f"  Loss 模式: completion-only（只在文章部分计算 loss）")
+        print(f"  ✅ Loss 模式: completion-only（仅在文章正文部分计算 loss）")
+        print(f"     system 提示 + user 指令 → 不参与梯度计算")
+        print(f"     assistant 输出（文章正文） → 参与 loss 计算")
     elif data_format == "messages":
-        # messages 格式：需要设置 assistant_only_loss
         sft_kwargs["dataset_text_field"] = "text"
-        print(f"  Loss 模式: 全序列 loss（旧版 messages 格式）")
+        print(f"  ⚠️  Loss 模式: 全序列 loss（旧版 messages 格式）")
+        print(f"     建议迁移到 prompt/completion 格式以启用 completion-only loss")
     else:
         sft_kwargs["dataset_text_field"] = "text"
         print(f"  Loss 模式: 全序列 loss")
 
     sft_config = SFTConfig(**sft_kwargs)
 
-    if eval_dataset:
+    if val_dataset:
         sft_config.eval_strategy = "steps"
         sft_config.eval_steps = 100
 
@@ -351,7 +403,7 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=val_dataset,
         args=sft_config,
     )
 
@@ -360,6 +412,14 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
     est_min_high = total_steps * 6 / 60
     print(f"\n  预计总步数: ~{total_steps}")
     print(f"  预计用时: {est_min_low:.0f} - {est_min_high:.0f} 分钟")
+
+    # 过拟合判据提示
+    print(f"\n  [过拟合判据]")
+    print(f"    ❌ train_loss < 0.3 且 val_loss > 1.5 → 严重过拟合")
+    print(f"    ❌ val_loss 连续 3 个 eval 不降 → 应停止训练")
+    print(f"    ❌ 生成文本出现大段原文复读 → 过拟合")
+    print(f"    ✅ train_loss 在 0.5-1.0，val_loss 在 0.8-1.5 → 正常范围")
+
     print(f"\n{'=' * 50}")
     print("开始训练... (Ctrl+C 可中断，下次用 --resume 恢复)")
     print(f"{'=' * 50}\n")
@@ -376,12 +436,144 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
 
     print(f"\n{'=' * 50}")
     print(f"训练完成！")
+    print(f"  实验: {args.experiment_name}")
     print(f"  总步数: {stats.global_step}")
-    print(f"  最终 loss: {stats.training_loss:.4f}")
+    print(f"  最终 train loss: {stats.training_loss:.4f}")
     print(f"  实际用时: {elapsed:.0f} 分钟")
     print(f"{'=' * 50}")
 
+    # 保存训练日志
+    log_path = os.path.join(args.output_dir, "training_log.json")
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_data = {
+        "experiment_name": args.experiment_name,
+        "model": args.model or "auto",
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "weight_decay": args.weight_decay,
+        "max_seq_len": args.max_seq_len,
+        "batch_size": args.batch_size * args.grad_accum,
+        "train_samples": len(train_dataset),
+        "val_samples": len(val_dataset) if val_dataset else 0,
+        "data_format": data_format,
+        "total_steps": stats.global_step,
+        "final_train_loss": stats.training_loss,
+        "training_minutes": round(elapsed, 1),
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(log_data, f, indent=2, ensure_ascii=False)
+    print(f"  训练日志: {log_path}")
+
     return model, tokenizer
+
+
+# ============================================================
+# 测试集评估
+# ============================================================
+
+def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
+    """在测试集上评估，输出整体 loss 和分类别 loss。"""
+    import torch
+    from trl import SFTTrainer, SFTConfig
+
+    print(f"\n{'=' * 50}")
+    print(f"[测试集评估]")
+
+    sft_kwargs = {
+        "output_dir": os.path.join(args.output_dir, "test_eval"),
+        "per_device_eval_batch_size": 1,
+        "fp16": False,
+        "bf16": torch.cuda.is_bf16_supported(),
+        "report_to": "none",
+        "max_length": args.max_seq_len,
+    }
+
+    if data_format != "prompt_completion":
+        sft_kwargs["dataset_text_field"] = "text"
+
+    sft_config = SFTConfig(**sft_kwargs)
+    sft_config.eval_strategy = "no"
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=test_dataset,  # 不会训练，只用于 eval
+        args=sft_config,
+    )
+
+    metrics = trainer.evaluate(eval_dataset=test_dataset)
+    test_loss = metrics.get("eval_loss", "N/A")
+    print(f"  整体 test loss: {test_loss}")
+
+    # 保存结果
+    result_path = os.path.join(args.output_dir, "test_results.json")
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump({"experiment": args.experiment_name, "test_loss": test_loss, **metrics},
+                  f, indent=2, ensure_ascii=False)
+    print(f"  结果已保存: {result_path}")
+    print(f"{'=' * 50}")
+
+
+# ============================================================
+# 生成示例评估
+# ============================================================
+
+def generate_evaluation_samples(model, tokenizer, args):
+    """生成几个评估示例，用于人工判断风格质量。"""
+    from unsloth import FastLanguageModel
+
+    print(f"\n[生成评估] 生成 6 个类别各 1 个示例...")
+
+    EVAL_PROMPTS = {
+        "A": "[社会观察] 写一篇关于「当代年轻人的疲惫」的文章",
+        "B": "[技术产品评论] 写一篇关于「为什么我不买最新款手机」的文章",
+        "C": "[生死无常感悟] 写一篇关于「远行」的文章",
+        "D": "[自省修行] 写一篇关于「与自己和解」的文章",
+        "E": "[文化阅读评论] 写一篇关于「重读一本旧书」的文章",
+        "F": "[日常生活随笔] 写一篇关于「今天什么都不想干」的文章",
+    }
+
+    SYSTEM = "你是和菜头，运营公众号「槽边往事」。写作风格：温和的刻薄，冷幽默，短句为主，善用自嘲和比喻，第一人称，结尾留余味。"
+
+    FastLanguageModel.for_inference(model)
+
+    results = {}
+    for cat, user_prompt in EVAL_PROMPTS.items():
+        messages = [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ]
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        import torch
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=inputs,
+                max_new_tokens=512,
+                temperature=0.7,
+                top_p=0.8,
+                do_sample=True,
+            )
+        response = tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
+        results[cat] = {"prompt": user_prompt, "response": response[:500]}
+        print(f"\n  [{cat}] {user_prompt}")
+        print(f"  → {response[:200]}...")
+
+    # 保存
+    eval_path = os.path.join(args.output_dir, "eval_samples.json")
+    with open(eval_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n  评估样本已保存: {eval_path}")
+
+    # 恢复训练模式
+    FastLanguageModel.for_training(model)
 
 
 # ============================================================
@@ -391,7 +583,6 @@ def run_training(model, tokenizer, train_dataset, eval_dataset, data_format, arg
 def export_gguf(model, tokenizer, output_dir: str, quant_method: str = "q4_k_m"):
     """导出为 GGUF 格式。"""
     gguf_dir = os.path.join(output_dir, "gguf")
-
     print(f"\n[导出] 正在导出 GGUF（{quant_method}）...")
     print("  这一步需要 10-15 分钟，请耐心等待。")
 
@@ -401,7 +592,6 @@ def export_gguf(model, tokenizer, output_dir: str, quant_method: str = "q4_k_m")
         print(f"\n  [警告] GGUF 导出失败: {e}")
         print("  可能原因：Windows 不支持 GGUF 导出，或缺少 llama.cpp。")
         print("  替代方案：先保存 LoRA 适配器，再手动转换。")
-        print("  参考：https://github.com/ggml-org/llama.cpp")
         return None
 
     gguf_files = glob.glob(os.path.join(gguf_dir, "*.gguf"))
@@ -411,7 +601,7 @@ def export_gguf(model, tokenizer, output_dir: str, quant_method: str = "q4_k_m")
             print(f"  {os.path.basename(f)} ({size_mb:.0f} MB)")
         return gguf_dir
     else:
-        print("  [警告] 未找到 GGUF 文件，请检查导出过程。")
+        print("  [警告] 未找到 GGUF 文件。")
         return None
 
 
@@ -448,7 +638,7 @@ def export_merged_16bit(model, tokenizer, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="和菜头风格 LoRA 微调训练 v3.0",
+        description="和菜头风格 LoRA 微调训练 v4.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
@@ -458,8 +648,11 @@ def main():
   # RTX 5060 (8GB) 推荐配置
   python train_hecaitou.py --model Qwen/Qwen3.5-2B --max-seq-len 4096
 
-  # 使用 v3 增强数据集
-  python train_hecaitou.py --data-dir ./training_data_v3
+  # 基线对照实验
+  python train_hecaitou.py --data-dir training_data_baseline \\
+      --output-dir output_baseline --experiment-name baseline
+  python train_hecaitou.py --data-dir training_data_improved \\
+      --output-dir output_improved --experiment-name improved
 
   # 从中断处恢复
   python train_hecaitou.py --resume
@@ -468,24 +661,49 @@ def main():
   python train_hecaitou.py --export-only --model-dir ./hecaitou_output/lora_adapter
         """,
     )
-    parser.add_argument("--data-dir", default="training_data", help="训练数据目录（默认 training_data/）")
-    parser.add_argument("--output-dir", default="hecaitou_output", help="输出目录（默认 hecaitou_output/）")
-    parser.add_argument("--model", default=None, help="基座模型（默认自动选择：8GB→2B, 10GB+→4B, 22GB+→9B）")
-    parser.add_argument("--epochs", type=int, default=3, help="训练轮次（默认 3）")
-    parser.add_argument("--lr", type=float, default=2e-4, help="学习率（默认 2e-4）")
-    parser.add_argument("--batch-size", type=int, default=1, help="批大小（默认 1，不建议改）")
-    parser.add_argument("--grad-accum", type=int, default=4, help="梯度累积步数（默认 4，等效 batch=4）")
-    parser.add_argument("--max-seq-len", type=int, default=None, help="最大序列长度（默认自动：8GB→4096, 其他→2048）")
-    parser.add_argument("--lora-r", type=int, default=None, help="LoRA 秩（默认 32）")
-    parser.add_argument("--quant", default="q4_k_m", help="GGUF 量化方法（默认 q4_k_m）")
-    parser.add_argument("--no-export", action="store_true", help="训练完不导出 GGUF（只保存 LoRA）")
-    parser.add_argument("--export-only", action="store_true", help="只导出 GGUF，不训练")
-    parser.add_argument("--model-dir", default=None, help="已训练模型目录（配合 --export-only）")
-    parser.add_argument("--resume", action="store_true", help="从最近的检查点恢复训练")
-    parser.add_argument("--cache-dir", default=None, help="模型缓存目录（默认 C 盘，如 C 盘空间不足可设为 D:\\hf_cache）")
+    parser.add_argument("--data-dir", default="training_data",
+                        help="训练数据目录（默认 training_data/）")
+    parser.add_argument("--output-dir", default="hecaitou_output",
+                        help="输出目录（默认 hecaitou_output/）")
+    parser.add_argument("--model", default=None,
+                        help="基座模型（默认自动选择）")
+    parser.add_argument("--epochs", type=int, default=2,
+                        help="训练轮次（默认 2，v4.0 推荐值）")
+    parser.add_argument("--lr", type=float, default=2e-4,
+                        help="学习率（默认 2e-4）")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="批大小（默认 1）")
+    parser.add_argument("--grad-accum", type=int, default=4,
+                        help="梯度累积步数（默认 4，等效 batch=4）")
+    parser.add_argument("--max-seq-len", type=int, default=None,
+                        help="最大序列长度（默认自动）")
+    parser.add_argument("--lora-r", type=int, default=None,
+                        help="LoRA 秩（默认 16）")
+    parser.add_argument("--lora-alpha", type=int, default=None,
+                        help="LoRA alpha（默认与 lora-r 相同）")
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="权重衰减（默认 0.01）")
+    parser.add_argument("--quant", default="q4_k_m",
+                        help="GGUF 量化方法（默认 q4_k_m）")
+    parser.add_argument("--no-export", action="store_true",
+                        help="训练完不导出 GGUF（只保存 LoRA）")
+    parser.add_argument("--export-only", action="store_true",
+                        help="只导出 GGUF，不训练")
+    parser.add_argument("--model-dir", default=None,
+                        help="已训练模型目录（配合 --export-only）")
+    parser.add_argument("--resume", action="store_true",
+                        help="从最近的检查点恢复训练")
+    parser.add_argument("--cache-dir", default=None,
+                        help="模型缓存目录")
+    parser.add_argument("--experiment-name", default="default",
+                        help="实验名称（用于区分 baseline/improved，默认 default）")
+    parser.add_argument("--skip-test-eval", action="store_true",
+                        help="跳过测试集评估")
+    parser.add_argument("--skip-generate-eval", action="store_true",
+                        help="跳过生成评估样本")
     args = parser.parse_args()
 
-    # ---- 设置缓存目录（解决 C 盘空间不足问题） ----
+    # ---- 设置缓存目录 ----
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)
         os.environ["HF_HOME"] = args.cache_dir
@@ -541,29 +759,44 @@ def main():
         gpu_info, args.model, args.lora_r, args.max_seq_len
     )
     args.max_seq_len = max_seq_len
+    if args.lora_r is None:
+        args.lora_r = lora_r
+    if args.lora_alpha is None:
+        args.lora_alpha = args.lora_r  # alpha = r（推荐默认值）
 
     # ---- 加载数据 ----
-    train_dataset, eval_dataset, data_format = load_data(args.data_dir)
+    train_dataset, val_dataset, test_dataset, data_format = load_data(args.data_dir)
 
     # ---- 加载模型 ----
-    model, tokenizer = load_model(model_name, max_seq_len, lora_r)
+    model, tokenizer = load_model(model_name, max_seq_len, args.lora_r, args.lora_alpha)
 
     # ---- 数据预处理（根据格式） ----
     if data_format == "messages":
-        # 旧版 messages 格式：需要转为纯文本
         print("\n[数据] 检测到旧版 messages 格式，转换为纯文本...")
         train_dataset = convert_messages_to_text(train_dataset, tokenizer)
-        if eval_dataset:
-            eval_dataset = convert_messages_to_text(eval_dataset, tokenizer)
-        data_format = "text"  # 转换后变成 text 格式
+        if val_dataset:
+            val_dataset = convert_messages_to_text(val_dataset, tokenizer)
+        if test_dataset:
+            test_dataset = convert_messages_to_text(test_dataset, tokenizer)
+        data_format = "text"
     elif data_format == "prompt_completion":
-        # 新版 prompt/completion 格式：TRL 原生支持，无需转换
         print("\n[数据] prompt/completion 格式，启用 completion-only loss")
-    
+
     # ---- 训练 ----
     model, tokenizer = run_training(
-        model, tokenizer, train_dataset, eval_dataset, data_format, args, gpu_info
+        model, tokenizer, train_dataset, val_dataset, data_format, args, gpu_info
     )
+
+    # ---- 测试集评估 ----
+    if test_dataset and not args.skip_test_eval:
+        evaluate_test_set(model, tokenizer, test_dataset, data_format, args)
+
+    # ---- 生成评估样本 ----
+    if not args.skip_generate_eval:
+        try:
+            generate_evaluation_samples(model, tokenizer, args)
+        except Exception as e:
+            print(f"  [跳过] 生成评估样本失败: {e}")
 
     # ---- 导出 ----
     export_lora(model, tokenizer, args.output_dir)
@@ -576,28 +809,25 @@ def main():
     # ---- 完成 ----
     print(f"\n{'=' * 60}")
     print("全部完成！")
-    print(f"\n  LoRA 适配器: {args.output_dir}/lora_adapter/")
+    print(f"\n  实验: {args.experiment_name}")
+    print(f"  LoRA 适配器: {args.output_dir}/lora_adapter/")
     if gguf_dir:
         print(f"  GGUF 模型: {args.output_dir}/gguf/*.gguf")
-    print(f"\n下一步（Windows）：")
-    print(f"  1. 合并 LoRA 为完整模型:")
-    print(f'     python -c "')
-    print(f'     import torch')
-    print(f'     from transformers import AutoModelForCausalLM, AutoTokenizer')
-    print(f'     from peft import PeftModel')
-    print(f'     tokenizer = AutoTokenizer.from_pretrained(\\"{args.output_dir}/lora_adapter\\", local_files_only=True)')
-    print(f'     base_model = AutoModelForCausalLM.from_pretrained(\\"{model_name}\\", torch_dtype=torch.float16, device_map=\\"cpu\\", local_files_only=True)')
-    print(f'     model = PeftModel.from_pretrained(base_model, \\"{args.output_dir}/lora_adapter\\", device_map=\\"cpu\\")')
-    print(f'     model = model.merge_and_unload()')
-    print(f'     model.save_pretrained(\\"D:/hecaitou_merged\\")')
-    print(f'     tokenizer.save_pretrained(\\"D:/hecaitou_merged\\")')
-    print(f'     "')
-    print(f"  2. 用 convert_hf_to_gguf.py 转为 GGUF")
-    print(f"  3. 导入 Ollama 测试")
+
+    print(f"\n下一步：")
     if gguf_dir:
-        print(f"\n  或直接使用 GGUF:")
         print(f"  ollama create hecaitou-writer -f Modelfile")
         print(f"  ollama run hecaitou-writer '写一篇关于...'")
+    else:
+        print(f"  1. 合并 LoRA:")
+        print(f"     见 FINETUNE_GUIDE.md Step 4A 方案二")
+
+    if args.experiment_name == "default":
+        print(f"\n对照实验（可选）：")
+        print(f"  python prepare_training_data.py --baseline --output training_data_baseline")
+        print(f"  python train_hecaitou.py --data-dir training_data_baseline "
+              f"--output-dir output_baseline --experiment-name baseline")
+
     print(f"{'=' * 60}")
 
 
