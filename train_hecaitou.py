@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-和菜头风格 LoRA 微调训练脚本 v4.0
+和菜头风格 LoRA 微调训练脚本 v4.1
 ==================================
 基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1060 篇文章进行风格微调。
+
+v4.1 修复（2026-03-13）：
+  - 修复 RuntimeError "You must specify a formatting_func" 的根因：
+    TRL v0.24（Unsloth 锁定版本）不接受 list[dict] 格式的 prompt/completion，
+    必须是纯字符串。prepare_training_data.py v4.0 已改为输出 ChatML 纯字符串，
+    但 train_hecaitou.py 中的 print_category_distribution、evaluate_test_set
+    仍假设旧格式，已全部修复为兼容新旧两种格式。
+  - print_category_distribution: 兼容 str / list[dict] / messages 三种 prompt 格式
+  - evaluate_test_set: 添加 formatting_func + DataCollatorForCompletionOnlyLM，
+    与训练阶段保持一致（之前缺失导致评估也会报错）
 
 v4.0 更新（2026-03-13）：
   - train/val/test 三路数据：训练用 train，中间评估用 val，最终评估用 test
@@ -60,7 +70,7 @@ from pathlib import Path
 def check_environment():
     """检查运行环境，返回 GPU 信息。"""
     print("=" * 60)
-    print("和菜头风格 LoRA 微调训练脚本 v4.0")
+    print("和菜头风格 LoRA 微调训练脚本 v4.1")
     print("=" * 60)
 
     try:
@@ -236,30 +246,48 @@ def load_data(data_dir: str):
 
 
 def print_category_distribution(jsonl_path: str, label: str):
-    """从 JSONL 文件中统计并打印类别分布（从 prompt 文本中提取类别）。"""
+    """从 JSONL 文件中统计并打印类别分布（从 prompt 文本中提取类别）。
+    
+    兼容两种格式：
+      - v4.0 新格式：prompt 是 ChatML 纯字符串
+      - v3.0 旧格式：prompt 是 list[dict]（自动兼容）
+    """
     CATEGORY_LABELS = {
         "A": "社会观察", "B": "技术产品评论", "C": "生死无常感悟",
         "D": "自省修行", "E": "文化阅读评论", "F": "日常生活随笔",
     }
-    # 尝试从文件中读取类别
     cat_counts = collections.Counter()
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 data = json.loads(line)
-                # 尝试从 prompt 内容中提取类别标签
+                prompt_content = ""
                 if "prompt" in data:
-                    user_content = ""
-                    for msg in data["prompt"]:
-                        if msg.get("role") == "user":
-                            user_content = msg.get("content", "")
+                    prompt_val = data["prompt"]
+                    if isinstance(prompt_val, str):
+                        # v4.0: prompt 是 ChatML 纯字符串
+                        prompt_content = prompt_val
+                    elif isinstance(prompt_val, list):
+                        # v3.0 旧格式: prompt 是 list[dict]
+                        for msg in prompt_val:
+                            if isinstance(msg, dict) and msg.get("role") == "user":
+                                prompt_content = msg.get("content", "")
+                                break
+                elif "messages" in data:
+                    # 更旧的 messages 格式
+                    for msg in data["messages"]:
+                        if isinstance(msg, dict) and msg.get("role") == "user":
+                            prompt_content = msg.get("content", "")
                             break
-                    for code, label_name in CATEGORY_LABELS.items():
-                        if label_name in user_content:
-                            cat_counts[code] += 1
-                            break
-                    else:
-                        cat_counts["?"] += 1
+
+                matched = False
+                for code, label_name in CATEGORY_LABELS.items():
+                    if label_name in prompt_content:
+                        cat_counts[code] += 1
+                        matched = True
+                        break
+                if not matched:
+                    cat_counts["?"] += 1
     except Exception:
         return
 
@@ -381,17 +409,71 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         "max_length": args.max_seq_len,
     }
 
+    # ================================================================
+    # 核心修复：为 prompt/completion 格式提供 formatting_func
+    #
+    # 根因：Unsloth 2026.3 + TRL v0.24 的 SFTTrainer 要求：
+    #   - 要么 dataset 有 "text" 字段 + dataset_text_field="text"
+    #   - 要么提供 formatting_func
+    #   即使 dataset 里有 "prompt"/"completion" 字段（纯字符串），
+    #   Unsloth 的 patch 仍然会检查是否提供了 formatting_func，
+    #   如果没有就抛出：RuntimeError: You must specify a formatting_func
+    #
+    # 解决方案：
+    #   显式提供 formatting_func，将 prompt + completion 拼接为完整文本。
+    #   同时设置 dataset_text_field="text"，让 Unsloth 正常工作。
+    #
+    # Completion-only loss 实现方式：
+    #   在 prompt/completion 格式下，prompt 以 <|im_start|>assistant\n 结尾，
+    #   completion 是纯正文 + <|im_end|>。
+    #   通过 response_template 参数告诉 TRL：
+    #   只对 "<|im_start|>assistant\n" 之后的内容计算 loss。
+    # ================================================================
+
+    formatting_func = None
+    trainer_extra_kwargs = {}
+
     if data_format == "prompt_completion":
-        print(f"  ✅ Loss 模式: completion-only（仅在文章正文部分计算 loss）")
-        print(f"     system 提示 + user 指令 → 不参与梯度计算")
-        print(f"     assistant 输出（文章正文） → 参与 loss 计算")
-    elif data_format == "messages":
+        # prompt/completion 均为纯字符串（ChatML 格式）
+        def _format_prompt_completion(example):
+            prompt = example.get("prompt", "")
+            completion = example.get("completion", "")
+            if not prompt or not completion:
+                return ""
+            return prompt + completion
+
+        formatting_func = _format_prompt_completion
         sft_kwargs["dataset_text_field"] = "text"
-        print(f"  ⚠️  Loss 模式: 全序列 loss（旧版 messages 格式）")
+
+        # 设置 response_template 实现 completion-only loss
+        # prompt 以 "<|im_start|>assistant\n" 结尾，
+        # TRL 的 DataCollatorForCompletionOnlyLM 会在此标记之后开始计算 loss
+        try:
+            from trl import DataCollatorForCompletionOnlyLM
+            response_template = "<|im_start|>assistant\n"
+            collator = DataCollatorForCompletionOnlyLM(
+                response_template=response_template,
+                tokenizer=tokenizer,
+            )
+            trainer_extra_kwargs["data_collator"] = collator
+            print(f"  ✅ Loss 路径: prompt/completion + formatting_func + DataCollatorForCompletionOnlyLM")
+            print(f"     response_template = '<|im_start|>assistant\\n'")
+            print(f"     system 提示 + user 指令 → 不参与梯度计算")
+            print(f"     assistant 输出（文章正文） → 参与 loss 计算")
+        except Exception as e:
+            print(f"  ⚠️  DataCollatorForCompletionOnlyLM 加载失败: {e}")
+            print(f"  ⚠️  回退: prompt/completion + formatting_func（全序列 loss）")
+            print(f"     所有 token 均参与 loss 计算")
+
+    elif data_format == "text":
+        # messages 转换后的纯文本格式
+        sft_kwargs["dataset_text_field"] = "text"
+        print(f"  ⚠️  Loss 路径: messages → 纯文本（全序列 loss）")
         print(f"     建议迁移到 prompt/completion 格式以启用 completion-only loss")
+
     else:
         sft_kwargs["dataset_text_field"] = "text"
-        print(f"  Loss 模式: 全序列 loss")
+        print(f"  Loss 路径: fallback 纯文本（全序列 loss）")
 
     sft_config = SFTConfig(**sft_kwargs)
 
@@ -404,7 +486,9 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        formatting_func=formatting_func,
         args=sft_config,
+        **trainer_extra_kwargs,
     )
 
     total_steps = len(train_dataset) * args.epochs // (args.batch_size * args.grad_accum)
@@ -490,7 +574,32 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         "max_length": args.max_seq_len,
     }
 
-    if data_format != "prompt_completion":
+    # 与训练一致：prompt_completion 格式需要 formatting_func + data_collator
+    formatting_func = None
+    trainer_extra_kwargs = {}
+
+    if data_format == "prompt_completion":
+        def _format_prompt_completion(example):
+            prompt = example.get("prompt", "")
+            completion = example.get("completion", "")
+            if not prompt or not completion:
+                return ""
+            return prompt + completion
+
+        formatting_func = _format_prompt_completion
+        sft_kwargs["dataset_text_field"] = "text"
+
+        try:
+            from trl import DataCollatorForCompletionOnlyLM
+            response_template = "<|im_start|>assistant\n"
+            collator = DataCollatorForCompletionOnlyLM(
+                response_template=response_template,
+                tokenizer=tokenizer,
+            )
+            trainer_extra_kwargs["data_collator"] = collator
+        except Exception:
+            pass
+    else:
         sft_kwargs["dataset_text_field"] = "text"
 
     sft_config = SFTConfig(**sft_kwargs)
@@ -500,7 +609,9 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         model=model,
         tokenizer=tokenizer,
         train_dataset=test_dataset,  # 不会训练，只用于 eval
+        formatting_func=formatting_func,
         args=sft_config,
+        **trainer_extra_kwargs,
     )
 
     metrics = trainer.evaluate(eval_dataset=test_dataset)

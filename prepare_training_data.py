@@ -451,27 +451,50 @@ def generate_instruction(article: dict, rng: random.Random, use_category: bool =
 # 转换为训练格式
 # ============================================================
 
+def messages_to_chatml(messages: list) -> str:
+    """
+    将 [{"role":...,"content":...},...] 转换为 ChatML 纯文本字符串。
+    
+    关键：TRL v0.24（Unsloth 锁定版本）要求 prompt/completion 是纯字符串，
+    不能是 list[dict]。否则 Unsloth 会抛出：
+      RuntimeError: You must specify a formatting_func
+    """
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    return "\n".join(parts)
+
+
 def article_to_prompt_completion(article: dict, rng: random.Random,
                                   use_category: bool = True) -> dict:
     """
     将单篇文章转换为 prompt/completion 训练样本。
-    TRL 的 prompt/completion 格式天然支持 completion-only loss。
+    
+    输出格式：prompt 和 completion 均为 ChatML 纯文本字符串。
+    TRL v0.24 的 SFTTrainer 会自动对 completion 部分计算 loss，
+    prompt 部分不参与梯度计算 → completion-only loss。
     """
     instruction = generate_instruction(article, rng, use_category=use_category)
 
-    prompt = [
+    # 构造 prompt 部分：system + user（ChatML 纯文本字符串）
+    prompt_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": instruction},
     ]
+    prompt_str = messages_to_chatml(prompt_messages)
+    # 在 prompt 末尾加上 assistant 的起始标记，让 completion 紧接其后
+    prompt_str += "\n<|im_start|>assistant\n"
 
+    # 构造 completion 部分：纯文章正文（紧跟 prompt 的 assistant 标记）
     output_text = f"# {article['title']}\n\n{article['body']}"
-    completion = [
-        {"role": "assistant", "content": output_text},
-    ]
+    completion_str = output_text + "<|im_end|>"
 
     return {
-        "prompt": prompt,
-        "completion": completion,
+        "prompt": prompt_str,
+        "completion": completion_str,
         "_meta": {
             "title": article["title"],
             "category": article["category"],
@@ -527,9 +550,8 @@ def compute_stats(samples: List[dict], data_format: str) -> dict:
         if data_format == "messages":
             full_text = "".join(m["content"] for m in s["messages"])
         else:
-            prompt_text = "".join(m["content"] for m in s["prompt"])
-            completion_text = "".join(m["content"] for m in s["completion"])
-            full_text = prompt_text + completion_text
+            # v4.0: prompt 和 completion 是纯字符串
+            full_text = s["prompt"] + s["completion"]
         token_counts.append(estimate_tokens(full_text))
 
     token_counts.sort()
@@ -604,8 +626,9 @@ def show_random_samples(samples: List[dict], n: int = 5, seed: int = 42, data_fo
             user_msg = s["messages"][1]["content"]
             asst_preview = s["messages"][2]["content"][:120]
         else:
-            user_msg = s["prompt"][1]["content"]
-            asst_preview = s["completion"][0]["content"][:120]
+            # v4.0: prompt/completion 是纯字符串
+            user_msg = s["prompt"][:200]
+            asst_preview = s["completion"][:120]
 
         print(f"  [User] {user_msg[:200]}")
         print(f"  [Asst] {asst_preview}...")
@@ -844,11 +867,9 @@ def main():
                     print(f"[{role}] {content}")
             else:
                 print("[PROMPT]")
-                for m in s["prompt"]:
-                    print(f"  [{m['role']}] {m['content'][:300]}")
+                print(f"  {s['prompt'][:400]}")
                 print("[COMPLETION]")
-                for m in s["completion"]:
-                    print(f"  [{m['role']}] {m['content'][:200]}...")
+                print(f"  {s['completion'][:200]}...")
         return
 
     # ---- Step 8: 写入文件 ----
