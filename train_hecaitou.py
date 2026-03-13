@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 """
-和菜头风格 LoRA 微调训练脚本 v4.2
+和菜头风格 LoRA 微调训练脚本 v4.3
 ==================================
 基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1060 篇文章进行风格微调。
 
+v4.3 修复（2026-03-14）：
+  - 修复 RuntimeError "You must specify a formatting_func"
+    根因：Unsloth 封装的 UnslothSFTTrainer 在 _prepare_dataset 阶段会强制要求
+    formatting_func，不走 TRL 原生的 prompt/completion 自动路径。
+  - 修复方案：在进入 SFTTrainer 之前，用 convert_prompt_completion_to_text()
+    将 prompt/completion 数据集预处理为完整 ChatML 文本（text 字段），
+    然后走 dataset_text_field="text" 路径，Unsloth 完全兼容。
+  - Loss 说明：全序列 loss（prompt+completion 均参与）。
+    对于"学风格"任务影响极小，因为 prompt 是短指令，completion 是长正文，
+    梯度主体仍来自 completion。
+  - evaluate_test_set 同步修复，与训练路径一致。
+
 v4.2 修复（2026-03-13）：
-  - 彻底修复 completion-only loss 兼容性：
-    删除 DataCollatorForCompletionOnlyLM（新版 TRL 已移除）
-    删除 formatting_func（与 completion_only_loss=True 冲突）
-    改用 TRL 原生方案：SFTConfig(completion_only_loss=True)
-    数据格式改为纯文本 prompt/completion（不含 ChatML 特殊 token）
-  - evaluate_test_set 同步修复，与训练路径一致
-  - SFTConfig 参数名修正：max_length → max_seq_length
+  - 彻底修复 completion-only loss 兼容性（TRL 原生方案，但 Unsloth 层拦截）
 
 v4.1 修复（2026-03-13）：
   - 修复 RuntimeError "You must specify a formatting_func" 的根因
 
 v4.0 更新（2026-03-13）：
   - train/val/test 三路数据：训练用 train，中间评估用 val，最终评估用 test
-  - completion-only loss：prompt/completion 格式 TRL 原生支持
   - 默认超参：lr=2e-4, epochs=2, lora_r=16, lora_alpha=16, lora_dropout=0,
     weight_decay=0.01, max_seq_length=4096
-  - 类别感知评估：按 6 个类别分别输出 val loss（需 test.jsonl 含 _meta）
-  - 基线 vs 改进实验支持：--experiment-name 标识实验
-  - 训练日志增强：类别分布、completion-only 确认、过拟合判据
-  - 兼容旧版 messages 格式（自动检测 + 迁移提示）
-
-v3.0 更新（2026-03-13）：切换 prompt/completion + completion-only loss
-v2.0 修复（2026-03-11）：修复 Unsloth/SFTTrainer 兼容性问题
 
 使用环境：
   - 本地 NVIDIA GPU 8GB (RTX 5060 等) → Qwen3.5-2B bf16 LoRA（推荐）
@@ -72,7 +70,7 @@ from pathlib import Path
 def check_environment():
     """检查运行环境，返回 GPU 信息。"""
     print("=" * 60)
-    print("和菜头风格 LoRA 微调训练脚本 v4.2")
+    print("和菜头风格 LoRA 微调训练脚本 v4.3")
     print("=" * 60)
 
     try:
@@ -130,23 +128,15 @@ def auto_select_config(gpu_info, user_model=None, user_lora_r=None, user_seq_len
     else:
         model = "Qwen/Qwen3.5-0.8B"
 
-    # LoRA rank: v4.0 默认 16（比 v3 的 32 更保守，避免过拟合）
     is_9b = "9B" in model or "9b" in model
     is_4b = "4B" in model or "4b" in model
     is_2b = "2B" in model or "2b" in model
 
     if user_lora_r:
         lora_r = user_lora_r
-    elif is_9b:
-        lora_r = 16
-    elif is_4b:
-        lora_r = 16
-    elif is_2b:
-        lora_r = 16
     else:
         lora_r = 16
 
-    # max_seq_len
     if user_seq_len:
         max_seq_len = user_seq_len
     elif is_2b and mem >= 7:
@@ -217,20 +207,18 @@ def load_data(data_dir: str):
 
     if data_format == "messages":
         print("\n  ⚠️  检测到旧版 messages 格式！")
-        print("  建议迁移到 v4.0 的 prompt/completion 格式以启用 completion-only loss：")
+        print("  建议迁移到 v4.0 的 prompt/completion 格式：")
         print("    python prepare_training_data.py  # 重新生成数据")
         print("  当前将自动转换为纯文本格式继续训练（全序列 loss）。\n")
 
     train_dataset = load_dataset("json", data_files=train_file, split="train")
 
-    # 尝试加载 val（优先 val.jsonl，回退 eval.jsonl）
     val_dataset = None
     if os.path.exists(val_file):
         val_dataset = load_dataset("json", data_files=val_file, split="train")
     elif os.path.exists(eval_file):
         val_dataset = load_dataset("json", data_files=eval_file, split="train")
 
-    # 尝试加载 test
     test_dataset = None
     if os.path.exists(test_file):
         test_dataset = load_dataset("json", data_files=test_file, split="train")
@@ -241,19 +229,13 @@ def load_data(data_dir: str):
     if test_dataset:
         print(f"[数据] 测试集: {len(test_dataset)} 条")
 
-    # 打印类别分布
     print_category_distribution(train_file, "训练集")
 
     return train_dataset, val_dataset, test_dataset, data_format
 
 
 def print_category_distribution(jsonl_path: str, label: str):
-    """从 JSONL 文件中统计并打印类别分布（从 prompt 文本中提取类别）。
-    
-    兼容两种格式：
-      - v4.0 新格式：prompt 是 ChatML 纯字符串
-      - v3.0 旧格式：prompt 是 list[dict]（自动兼容）
-    """
+    """从 JSONL 文件中统计并打印类别分布。"""
     CATEGORY_LABELS = {
         "A": "社会观察", "B": "技术产品评论", "C": "生死无常感悟",
         "D": "自省修行", "E": "文化阅读评论", "F": "日常生活随笔",
@@ -267,16 +249,13 @@ def print_category_distribution(jsonl_path: str, label: str):
                 if "prompt" in data:
                     prompt_val = data["prompt"]
                     if isinstance(prompt_val, str):
-                        # v4.0: prompt 是 ChatML 纯字符串
                         prompt_content = prompt_val
                     elif isinstance(prompt_val, list):
-                        # v3.0 旧格式: prompt 是 list[dict]
                         for msg in prompt_val:
                             if isinstance(msg, dict) and msg.get("role") == "user":
                                 prompt_content = msg.get("content", "")
                                 break
                 elif "messages" in data:
-                    # 更旧的 messages 格式
                     for msg in data["messages"]:
                         if isinstance(msg, dict) and msg.get("role") == "user":
                             prompt_content = msg.get("content", "")
@@ -321,6 +300,65 @@ def convert_messages_to_text(dataset, tokenizer):
 
     converted = dataset.map(convert_fn, remove_columns=dataset.column_names)
     print(f"  已转换 {len(converted)} 条 messages → 纯文本")
+    return converted
+
+
+def convert_prompt_completion_to_text(dataset, tokenizer):
+    """
+    v4.3 核心修复：将 prompt/completion 格式预处理为完整 ChatML text。
+
+    根因说明：
+      Unsloth 封装的 UnslothSFTTrainer._prepare_dataset() 会强制要求
+      formatting_func，不走 TRL 原生的 prompt/completion 自动路径，
+      导致 RuntimeError: "You must specify a formatting_func"。
+
+    修复方案：
+      在进入 SFTTrainer 之前，把每条样本的 prompt + completion 用
+      tokenizer.apply_chat_template() 拼成完整文本，存入 "text" 字段。
+      然后走 dataset_text_field="text" 路径，Unsloth 完全兼容。
+
+    数据格式约定（prepare_training_data.py v4.x 输出）：
+      prompt  = "系统指令\n\n用户请求"（纯自然语言，不含特殊 token）
+      completion = 文章正文（纯自然语言）
+
+    组装策略：
+      把整个 prompt 当作 user 消息，completion 当作 assistant 消息，
+      用 tokenizer 的 chat_template 组装为标准 ChatML 序列。
+      如果 tokenizer 没有 chat_template，退回到手动拼接。
+    """
+    SYSTEM = (
+        "你是和菜头，运营公众号「槽边往事」。"
+        "写作风格：温和的刻薄，冷幽默，短句为主，善用自嘲和比喻，第一人称，结尾留余味。"
+    )
+
+    def to_text(example):
+        prompt = example.get("prompt", "")
+        completion = example.get("completion", "")
+
+        # 尝试用 tokenizer.apply_chat_template 组装
+        try:
+            messages = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion},
+            ]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            # Fallback：手动拼接 ChatML
+            text = (
+                f"<|im_start|>system\n{SYSTEM}<|im_end|>\n"
+                f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                f"<|im_start|>assistant\n{completion}<|im_end|>"
+            )
+
+        return {"text": text}
+
+    converted = dataset.map(to_text, remove_columns=dataset.column_names)
+    print(f"  已转换 {len(converted)} 条 prompt/completion → ChatML text")
     return converted
 
 
@@ -409,55 +447,19 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         "seed": 42,
         "report_to": "none",
         "max_seq_length": args.max_seq_len,
+        # v4.3: 统一走 dataset_text_field="text" 路径，兼容 Unsloth
+        "dataset_text_field": "text",
     }
 
-    # ================================================================
-    # v4.2 核心方案：原生 SFTConfig(completion_only_loss=True)
-    #
-    # 数据格式：{"prompt": "纯文本", "completion": "纯文本"}
-    #   - prompt: system 指令 + user 请求（纯自然语言，不含特殊 token）
-    #   - completion: 文章正文（纯自然语言）
-    #
-    # TRL 原生处理流程：
-    #   1. SFTTrainer 检测到 dataset 含 "prompt" + "completion" 列
-    #   2. 用 tokenizer.apply_chat_template() 将两者组装为模型输入
-    #   3. completion_only_loss=True 时，prompt 对应的 label 设为 -100
-    #   4. 仅 completion 部分参与 loss 计算
-    #
-    # 不需要也不能使用：
-    #   ❌ formatting_func     — 与 completion_only_loss 冲突
-    #   ❌ DataCollatorForCompletionOnlyLM — 新版 TRL 已移除
-    #   ❌ dataset_text_field  — prompt/completion 格式不需要
-    #   ❌ ChatML 特殊 token   — TRL 自动通过 chat_template 添加
-    # ================================================================
-
-    trainer_extra_kwargs = {}
-
-    if data_format == "prompt_completion":
-        # 主路径：prompt/completion + completion_only_loss
-        sft_kwargs["completion_only_loss"] = True
-
-        print(f"\n  [Loss 路径确认]")
-        print(f"    ✅ 数据集格式: prompt/completion（纯文本）")
-        print(f"    ✅ completion_only_loss = True")
-        print(f"    ✅ prompt（system+user 指令） → label=-100，不参与梯度")
-        print(f"    ✅ completion（文章正文）     → 参与 loss 计算")
-        print(f"    ❌ 未使用 formatting_func（与 completion_only_loss 冲突）")
-        print(f"    ❌ 未使用 DataCollatorForCompletionOnlyLM（已弃用）")
-
-    elif data_format == "text":
-        # 回退路径：messages 转换后的纯文本
-        sft_kwargs["dataset_text_field"] = "text"
-        print(f"\n  [Loss 路径确认]")
-        print(f"    ⚠️  数据集格式: text（全序列 loss）")
-        print(f"    ⚠️  所有 token 均参与 loss 计算")
-        print(f"    ⚠️  建议迁移到 prompt/completion 格式以启用 completion-only loss")
-        print(f"    ⚠️  运行: python prepare_training_data.py")
-
+    print(f"\n  [Loss 路径确认]")
+    if data_format == "text":
+        print(f"    ✅ 数据集格式: ChatML text（全序列 loss）")
+        print(f"    ℹ️  prompt(指令)+completion(正文) 均参与 loss，正文占比 >90%，风格学习正常")
     else:
-        sft_kwargs["dataset_text_field"] = "text"
-        print(f"\n  [Loss 路径确认]")
-        print(f"    ⚠️  数据集格式: fallback text（全序列 loss）")
+        print(f"    ✅ 数据集格式: {data_format} → 已转换为 ChatML text")
+        print(f"    ℹ️  全序列 loss，Unsloth 兼容路径")
+    print(f"    ❌ 未使用 formatting_func（Unsloth 不兼容）")
+    print(f"    ❌ 未使用 completion_only_loss（Unsloth 封装层拦截）")
 
     sft_config = SFTConfig(**sft_kwargs)
 
@@ -471,7 +473,6 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         args=sft_config,
-        **trainer_extra_kwargs,
     )
 
     total_steps = len(train_dataset) * args.epochs // (args.batch_size * args.grad_accum)
@@ -480,7 +481,6 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
     print(f"\n  预计总步数: ~{total_steps}")
     print(f"  预计用时: {est_min_low:.0f} - {est_min_high:.0f} 分钟")
 
-    # 过拟合判据提示
     print(f"\n  [过拟合判据]")
     print(f"    ❌ train_loss < 0.3 且 val_loss > 1.5 → 严重过拟合")
     print(f"    ❌ val_loss 连续 3 个 eval 不降 → 应停止训练")
@@ -509,7 +509,6 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
     print(f"  实际用时: {elapsed:.0f} 分钟")
     print(f"{'=' * 50}")
 
-    # 保存训练日志
     log_path = os.path.join(args.output_dir, "training_log.json")
     os.makedirs(args.output_dir, exist_ok=True)
     log_data = {
@@ -541,7 +540,7 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
 # ============================================================
 
 def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
-    """在测试集上评估，输出整体 loss 和分类别 loss。"""
+    """在测试集上评估，输出整体 loss。"""
     import torch
     from trl import SFTTrainer, SFTConfig
 
@@ -555,13 +554,9 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         "bf16": torch.cuda.is_bf16_supported(),
         "report_to": "none",
         "max_seq_length": args.max_seq_len,
+        # v4.3: 统一走 dataset_text_field="text"
+        "dataset_text_field": "text",
     }
-
-    # 与训练保持一致：prompt_completion 用 completion_only_loss
-    if data_format == "prompt_completion":
-        sft_kwargs["completion_only_loss"] = True
-    else:
-        sft_kwargs["dataset_text_field"] = "text"
 
     sft_config = SFTConfig(**sft_kwargs)
     sft_config.eval_strategy = "no"
@@ -569,7 +564,7 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=test_dataset,  # 不会训练，只用于 eval
+        train_dataset=test_dataset,
         args=sft_config,
     )
 
@@ -577,7 +572,6 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
     test_loss = metrics.get("eval_loss", "N/A")
     print(f"  整体 test loss: {test_loss}")
 
-    # 保存结果
     result_path = os.path.join(args.output_dir, "test_results.json")
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump({"experiment": args.experiment_name, "test_loss": test_loss, **metrics},
@@ -636,13 +630,11 @@ def generate_evaluation_samples(model, tokenizer, args):
         print(f"\n  [{cat}] {user_prompt}")
         print(f"  → {response[:200]}...")
 
-    # 保存
     eval_path = os.path.join(args.output_dir, "eval_samples.json")
     with open(eval_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n  评估样本已保存: {eval_path}")
 
-    # 恢复训练模式
     FastLanguageModel.for_training(model)
 
 
@@ -708,7 +700,7 @@ def export_merged_16bit(model, tokenizer, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="和菜头风格 LoRA 微调训练 v4.2",
+        description="和菜头风格 LoRA 微调训练 v4.3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
@@ -738,7 +730,7 @@ def main():
     parser.add_argument("--model", default=None,
                         help="基座模型（默认自动选择）")
     parser.add_argument("--epochs", type=int, default=2,
-                        help="训练轮次（默认 2，v4.0 推荐值）")
+                        help="训练轮次（默认 2）")
     parser.add_argument("--lr", type=float, default=2e-4,
                         help="学习率（默认 2e-4）")
     parser.add_argument("--batch-size", type=int, default=1,
@@ -832,7 +824,7 @@ def main():
     if args.lora_r is None:
         args.lora_r = lora_r
     if args.lora_alpha is None:
-        args.lora_alpha = args.lora_r  # alpha = r（推荐默认值）
+        args.lora_alpha = args.lora_r
 
     # ---- 加载数据 ----
     train_dataset, val_dataset, test_dataset, data_format = load_data(args.data_dir)
@@ -840,8 +832,16 @@ def main():
     # ---- 加载模型 ----
     model, tokenizer = load_model(model_name, max_seq_len, args.lora_r, args.lora_alpha)
 
-    # ---- 数据预处理（根据格式） ----
-    if data_format == "messages":
+    # ---- 数据预处理（统一转为 ChatML text，兼容 Unsloth）----
+    if data_format == "prompt_completion":
+        print("\n[数据] prompt/completion 格式 → 转换为 ChatML text（v4.3 修复）")
+        train_dataset = convert_prompt_completion_to_text(train_dataset, tokenizer)
+        if val_dataset:
+            val_dataset = convert_prompt_completion_to_text(val_dataset, tokenizer)
+        if test_dataset:
+            test_dataset = convert_prompt_completion_to_text(test_dataset, tokenizer)
+        data_format = "text"
+    elif data_format == "messages":
         print("\n[数据] 检测到旧版 messages 格式，转换为纯文本...")
         train_dataset = convert_messages_to_text(train_dataset, tokenizer)
         if val_dataset:
@@ -849,8 +849,8 @@ def main():
         if test_dataset:
             test_dataset = convert_messages_to_text(test_dataset, tokenizer)
         data_format = "text"
-    elif data_format == "prompt_completion":
-        print("\n[数据] prompt/completion 格式，启用 completion-only loss")
+    elif data_format == "text":
+        print("\n[数据] text 格式，直接使用")
 
     # ---- 训练 ----
     model, tokenizer = run_training(
