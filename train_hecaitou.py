@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-和菜头风格 LoRA 微调训练脚本 v4.3
+和菜头风格 LoRA 微调训练脚本 v4.4
 ==================================
 基于 Unsloth + Qwen3.5 + bf16 LoRA，使用和菜头 1060 篇文章进行风格微调。
+
+v4.4 修复（2026-03-18）：
+  - 修复 eval 阶段 CUDA OOM 问题
+    根因：eval 触发时显存已满，eval batch size 未显式限制，
+    且 eval_steps=100 过于频繁，导致 CUDA out of memory。
+  - 修复方案：
+    1. 显式设置 per_device_eval_batch_size=1
+    2. 启用 prediction_loss_only=True（只算 loss，不保存 logits）
+    3. 设置 eval_accumulation_steps=4（分批累积，不一次性堆 logits）
+    4. 将 eval_steps 从 100 改为 200，减少 eval 触发频率
+  - 预计效果：eval 阶段显存峰值降低约 40-60%，8GB 显存基本不再 OOM。
 
 v4.3 修复（2026-03-14）：
   - 修复 RuntimeError "You must specify a formatting_func"
@@ -70,7 +81,7 @@ from pathlib import Path
 def check_environment():
     """检查运行环境，返回 GPU 信息。"""
     print("=" * 60)
-    print("和菜头风格 LoRA 微调训练脚本 v4.3")
+    print("和菜头风格 LoRA 微调训练脚本 v4.4")
     print("=" * 60)
 
     try:
@@ -449,6 +460,12 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
         "max_seq_length": args.max_seq_len,
         # v4.3: 统一走 dataset_text_field="text" 路径，兼容 Unsloth
         "dataset_text_field": "text",
+        # v4.4: 显式限制 eval batch size，防止 OOM
+        "per_device_eval_batch_size": 1,
+        # v4.4: eval 时只计算 loss，不保存完整 logits，大幅降低显存峰值
+        "prediction_loss_only": True,
+        # v4.4: eval 分批累积，避免一次性堆积大量张量
+        "eval_accumulation_steps": 4,
     }
 
     print(f"\n  [Loss 路径确认]")
@@ -465,7 +482,8 @@ def run_training(model, tokenizer, train_dataset, val_dataset, data_format, args
 
     if val_dataset:
         sft_config.eval_strategy = "steps"
-        sft_config.eval_steps = 100
+        # v4.4: eval_steps 从 100 改为 200，减少 eval 触发频率，降低 OOM 风险
+        sft_config.eval_steps = 200
 
     trainer = SFTTrainer(
         model=model,
@@ -556,6 +574,9 @@ def evaluate_test_set(model, tokenizer, test_dataset, data_format, args):
         "max_seq_length": args.max_seq_len,
         # v4.3: 统一走 dataset_text_field="text"
         "dataset_text_field": "text",
+        # v4.4: 防止测试集评估也 OOM
+        "prediction_loss_only": True,
+        "eval_accumulation_steps": 4,
     }
 
     sft_config = SFTConfig(**sft_kwargs)
@@ -700,7 +721,7 @@ def export_merged_16bit(model, tokenizer, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="和菜头风格 LoRA 微调训练 v4.3",
+        description="和菜头风格 LoRA 微调训练 v4.4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
